@@ -1,0 +1,37 @@
+# https-proxy.compose.yml — nginx HTTPS reverse proxy in front of LibreChat.
+#
+# Run standalone:  docker compose -f https-proxy.compose.yml up -d
+# (or paste the `https-proxy` service into docker-compose.override.yml under services:)
+#
+# Requires: ud-assistant.conf next to this file, AND a Let's Encrypt cert already
+# issued into /etc/letsencrypt on the host (see HTTPS-SETUP.md, step 3).
+
+services:
+  https-proxy:
+    image: nginx:1.27-alpine
+    container_name: https-proxy
+    restart: unless-stopped
+    networks:
+      - librechat_default
+    ports:
+      # THIS is the one service that publishes host ports — it's the front door.
+      # Bound to all interfaces so VPN users on the UD network can reach it.
+      # - "80:80"
+      - "443:443"
+    volumes:
+      - ./ud-assistant.conf:/etc/nginx/conf.d/default.conf:ro
+      # Mount the host's Let's Encrypt dir read-only so nginx can read the cert.
+      # Renewal happens on the host (certbot timer); nginx just reads the files.
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    healthcheck:
+      # -k because the cert is valid but the healthcheck hits it by localhost.
+      test: ["CMD", "wget", "--no-check-certificate", "-qO-", "https://127.0.0.1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  librechat_default:
+    external: true
+    name: librechat_default

@@ -1,0 +1,43 @@
+# vllm-lb.compose.yml — add the nginx load balancer to your LibreChat stack.
+#
+# You can either:
+#   (a) paste this `vllm-lb` service into your docker-compose.override.yml
+#       under the existing `services:` key, OR
+#   (b) run it standalone with: docker compose -f vllm-lb.compose.yml up -d
+#       (the external network block below makes that work).
+#
+# Place vllm-lb.conf next to this file (same directory) before starting.
+
+services:
+  vllm-lb:
+    image: nginx:1.27-alpine
+    container_name: vllm-lb
+    restart: unless-stopped
+    networks:
+      - librechat_default
+    volumes:
+      # Mount the LB config as the default site. :ro = read-only.
+      - ./vllm-lb.conf:/etc/nginx/conf.d/default.conf:ro
+    # nginx-in-a-container reaches Spark A's HOST-run vLLM via the docker
+    # gateway. extra_hosts isn't strictly needed since the .conf hardcodes
+    # 172.22.0.1, but this documents the dependency and lets you switch the
+    # upstream to host.docker.internal:8000 if you prefer a name over an IP.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/lb-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # NOTE: intentionally NO `ports:` block. The LB is reached by other
+    # containers (LibreChat) by its service name on the shared network —
+    # same isolation pattern as ocr-service / searxng / firecrawl.
+    # If you ever need to curl it from the host for debugging, temporarily add:
+    #   ports:
+    #     - "127.0.0.1:8010:8000"
+
+networks:
+  librechat_default:
+    external: true
+    name: librechat_default
