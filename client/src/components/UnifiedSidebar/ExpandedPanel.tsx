@@ -1,6 +1,6 @@
 import { memo, useCallback, lazy, Suspense } from 'react';
 import { useRecoilValue } from 'recoil';
-import { SquarePen } from 'lucide-react';
+import { SquarePen, MessageSquarePlus, BarChart3 } from 'lucide-react';
 import { QueryKeys } from 'librechat-data-provider';
 import { useQueryClient } from '@tanstack/react-query';
 import { Skeleton, Sidebar, Button, TooltipAnchor } from '@librechat/client';
@@ -11,7 +11,18 @@ import { CLOSE_SIDEBAR_ID } from '~/components/Chat/Menus/OpenSidebar';
 import { useLocalize, useNewConvo } from '~/hooks';
 import { clearMessagesCache, cn } from '~/utils';
 import store from '~/store';
-
+/**
+ * UD Assistant customization: general feedback link.
+ * Distinct from the per-response 👍/👎 buttons — this collects overall
+ * impressions, feature requests, and bugs not tied to a single reply.
+ * Opens a Google Form in a new tab (access controlled on the form side).
+ */
+const FEEDBACK_FORM_URL = 'https://forms.gle/WbsXHRfb94QM136A7';
+/**
+ * UD Assistant customization: per-user usage stats page.
+ * Users log in with their LibreChat account and see only their own usage.
+ */
+const STATS_APP_URL = 'https://metrics.alphatest.udassistant.com';
 const AccountSettings = lazy(() => import('~/components/Nav/AccountSettings'));
 
 const NewChatButton = memo(function NewChatButton({
@@ -180,7 +191,41 @@ function ExpandedPanel({
         ))}
       </div>
 
-      <div className="mt-auto">
+      <div className="mt-auto flex flex-col gap-2">
+        {/* UD Assistant: per-user usage stats */}
+        <TooltipAnchor
+          side="right"
+          description="My Usage Stats"
+          render={
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="My Usage Stats"
+              className="h-9 w-9 rounded-lg"
+              onClick={() => window.open(STATS_APP_URL, '_blank', 'noopener,noreferrer')}
+            >
+              <BarChart3 aria-hidden="true" className="h-5 w-5 text-text-primary" />
+            </Button>
+          }
+        />
+        {/* UD Assistant: general feedback (Google Form, opens in new tab) */}
+        <TooltipAnchor
+          side="right"
+          description="Send Feedback"
+          render={
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Send Feedback"
+              className="h-9 w-9 rounded-lg"
+              onClick={() =>
+                window.open(FEEDBACK_FORM_URL, '_blank', 'noopener,noreferrer')
+              }
+            >
+              <MessageSquarePlus aria-hidden="true" className="h-5 w-5 text-text-primary" />
+            </Button>
+          }
+        />
         <Suspense fallback={<Skeleton className="h-9 w-9 rounded-lg" />}>
           <AccountSettings collapsed />
         </Suspense>
