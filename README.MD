@@ -232,6 +232,19 @@ After any `down`, confirm with `docker ps` that everything you expect is actuall
   `ports: []` nor a loopback entry in the override can remove a base mapping.
   Health check from the host: `docker exec https-proxy wget -qO- http://api:3080/health`
 
+- **Port not published to the host** — the `ports:` mapping in `docker-compose.yml` is
+  commented out. LibreChat is reachable only on the `librechat_default` network as
+  `http://api:3080`, with nginx as the sole entry point. Previously it bound `0.0.0.0:3080`,
+  letting anyone on the university network bypass TLS.
+  *This must be done in the base compose, not the override:* Compose **appends** list-valued
+  keys like `ports` across files rather than replacing them, so neither `ports: []` nor a
+  loopback entry in an override can remove a base mapping.
+  Health check: `docker exec https-proxy wget -qO- http://api:3080/health`
+- **admin-panel disabled** — given `profiles: ["admin"]` and its `ports:` commented out. It
+  served HTTP 200 with **no authentication** on `0.0.0.0:3004`. With the profile it no longer
+  starts on a normal `docker compose up -d`; run `docker compose --profile admin up -d` if
+  ever needed.
+
 ## Upstream / updates
 `origin` = this fork (`UD-FSAII/...`), `upstream` = `danny-avila/LibreChat`. We're pinned at
 v0.8.7 + our commits and do not auto-track. To pull a specific upstream security fix, cherry-pick
