@@ -39,7 +39,7 @@ interface:
   multiConvo: false 
   sharedLinks: false        # disable public conversation sharing
   agentApiKeys: false       # disable user-generated agent API keys
-
+  buildInfo: false
   memories: false
   customWelcome: "Welcome to UD Assistant. Ask a question, upload a document, or share an image to get started.."
 endpoints:

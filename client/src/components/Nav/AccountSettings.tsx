@@ -20,7 +20,12 @@ import { useAuthContext } from '~/hooks/AuthContext';
 import { useLocalize } from '~/hooks';
 import Settings from './Settings';
 import store from '~/store';
-
+/**
+ * UD Assistant customization: keyboard shortcuts dialog hidden.
+ * The shortcuts themselves still function; this only removes the reference list
+ * from the account menu. Set to true to restore.
+ */
+const ENABLE_SHORTCUTS_DIALOG = false;
 function HelpSubmenu({
   helpAndFaqURL,
   termsOfServiceURL,
@@ -64,10 +69,12 @@ function HelpSubmenu({
             {localize('com_nav_help_faq')}
           </Menu.MenuItem>
         )}
-        <Menu.MenuItem onClick={onShowShortcuts} className="select-item text-sm">
-          <Keyboard className="icon-md" aria-hidden="true" />
-          {localize('com_shortcut_keyboard_shortcuts')}
-        </Menu.MenuItem>
+        {ENABLE_SHORTCUTS_DIALOG && (
+          <Menu.MenuItem onClick={onShowShortcuts} className="select-item text-sm">
+            <Keyboard className="icon-md" aria-hidden="true" />
+            {localize('com_shortcut_keyboard_shortcuts')}
+          </Menu.MenuItem>
+        )}
         {showLegalDivider && (hasTos || hasPrivacy) && <DropdownMenuSeparator />}
         {hasTos && (
           <Menu.MenuItem
