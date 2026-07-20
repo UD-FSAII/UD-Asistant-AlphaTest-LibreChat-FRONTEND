@@ -8,6 +8,12 @@ import MessageAudio from './MessageAudio';
 import Feedback from './Feedback';
 import { cn } from '~/utils';
 import store from '~/store';
+/**
+ * UD Assistant customization: the message Edit button is disabled.
+ * Users should not be able to edit message content (their own prompts or the
+ * assistant's replies) in the UI. Set to true to restore upstream behavior.
+ */
+const ENABLE_MESSAGE_EDIT_BUTTON = false;
 
 type THoverButtons = {
   isEditing: boolean;
@@ -229,7 +235,7 @@ const HoverButtons = ({
       />
 
       {/* Edit Button */}
-      {isEditableEndpoint && (
+      {ENABLE_MESSAGE_EDIT_BUTTON && isEditableEndpoint && (
         <HoverButton
           id={`edit-${message.messageId}`}
           onClick={onEdit}

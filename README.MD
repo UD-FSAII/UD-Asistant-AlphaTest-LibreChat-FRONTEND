@@ -15,6 +15,13 @@ document Q&A, web search, and a simplified UI.
 The code diff from stock v0.8.7 is small; most customization is config + a few asset/HTML
 overrides mounted at runtime:
 
+- **UI: message Edit button hidden** — `client/src/components/Chat/Messages/HoverButtons.tsx`.
+  A constant `ENABLE_MESSAGE_EDIT_BUTTON = false` gates the existing `isEditableEndpoint`
+  condition, so no Edit (pencil) button renders on **any** message, user prompts or assistant
+  replies. Users should not be able to rewrite what the assistant said (or their own prompts)
+  in the UI. Set the constant to `true` to restore upstream behavior.
+  *Note:* the up-arrow keyboard shortcut (`hooks/Input/useHandleKeyUp.ts`) looks the button up
+  by id and already guards on `if (!element) return;`, so it degrades to a no-op. No change needed there.
 - **Branding** — replaced logos/favicons in `client/public/assets/` (`logo.svg`,
   `favicon-16x16.png`, `favicon-32x32.png`, `icon-192x192.png`, `apple-touch-icon-180x180.png`)
   and a custom `index.html` to fix the tab-title flash. (root §9)
@@ -112,19 +119,108 @@ See `vllm-lb/nginx-lb-SETUP.md` for the full runbook. Full detail: root §15.
 
 ---
 
-## Building from source (when you change React code)
-The image is prebuilt by default. To ship a code change (e.g. a UI customization), switch the
-override from `image:` to `build:` and build locally:
+## Building from source
+This fork **builds locally** rather than pulling upstream's prebuilt image, because it
+contains React source changes (see "What this fork changes"). In `docker-compose.override.yml`
+the `api` service is:
+```yaml
+    # image: ghcr.io/danny-avila/librechat:v0.8.7   # upstream prebuilt (rollback: swap the comments)
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ud-librechat:local
+```
+Build and deploy:
 ```bash
-# in docker-compose.override.yml, replace the api service's
-#   image: ghcr.io/danny-avila/librechat:v0.8.7
-# with
-#   build: .
-docker compose build api        # uses this repo's Dockerfile (Node per .nvmrc, currently 24.16.0)
+docker compose build api                      # ~2 min; Dockerfile sets NODE_OPTIONS=--max-old-space-size=6144
+docker compose up -d --force-recreate api
+docker compose logs --tail 20 api             # want "Server listening", no errors
+```
+Then **hard-refresh the browser (Ctrl-Shift-R) or use incognito** — the JS bundle caches hard,
+and a stale cache is the most common reason a UI change appears not to have worked.
+
+**Rollback:** swap the comments back to `image: ghcr.io/danny-avila/librechat:v0.8.7` and
+recreate. That image stays cached locally, so rollback takes under a minute. Note the
+prebuilt image does **not** contain our UI changes.
+
+Document any React/source change under "What this fork changes vs upstream" so the diff from
+stock v0.8.7 stays legible.
+
+---
+
+## Deployment gotchas 
+
+Building from source recreates containers, which activates settings that were previously
+dormant. Three failures hit in sequence on the first source build — **none caused by the code
+change itself**. All three surfaced to users as **502 Bad Gateway** from nginx.
+
+### 1. Do NOT set `UID`/`GID` in `.env`
+`docker-compose.yml` applies `user: "${UID}:${GID}"` to **three** services: `api`, `mongodb`,
+and `meilisearch`. When `UID`/`GID` are unset, this resolves to `user: ":"`, which Docker
+ignores, so each container runs as its image default. **That is the working configuration.**
+
+Setting `UID=1008`/`GID=1008` (to silence the compose warnings) forces all three services to
+the same UID and breaks two of them:
+- **LibreChat** crash-loops: `EACCES: permission denied, open '/app/logs/error-*.log'`
+- **MongoDB** crash-loops: `Failed to read metadata from /data/db/storage.bson`
+
+**The compose warnings about unset UID/GID are harmless. Leave them.**
+
+### 2. This host uses Docker userns-remap
+`/etc/docker/daemon.json` sets `"userns-remap": "default"` and `/etc/subuid` maps
+`dockremap:100000:65536`, so **container UID N = host UID 100000 + N**.
+
+Correct host ownership for the bind mounts:
+
+| Host path | Owner | Why |
+|---|---|---|
+| `logs/`, `uploads/`, `images/` | `100000:100000` | LibreChat image runs as container root (UID 0) |
+| `data-node/` | `100999:100000` | MongoDB image runs as container UID 999 |
+
+If you ever chown these, use the remapped values above — **not** your host UID. Chowning to a
+plain host UID (e.g. `1008`) grants access to an identity the container never uses, and the
+EACCES persists.
+
+> **Never chown `data-node/` casually** — it holds the entire chat database.
+
+### 3. `librechat.yaml` is schema-validated
+A stray top-level `mongodb:` key (a compose block pasted into the wrong file) caused:
+```
+Invalid custom config file at /app/librechat.yaml:
+Unrecognized key(s) in object: 'mongodb'
+Exiting due to invalid configuration.
+```
+Only LibreChat's documented keys belong in `librechat.yaml`; container/port settings belong in
+`docker-compose.override.yml`. Do **not** set `CONFIG_BYPASS_VALIDATION=true` to work around
+this — the validator is catching a real mistake.
+
+### Diagnosing a 502
+`502 Bad Gateway` from nginx almost always means the `api` container is not up. In order:
+```bash
+docker ps -a | grep -i librechat        # "Restarting" = crash loop → read the logs
+docker compose logs --tail 30 api       # the actual error
+docker logs chat-mongodb --tail 20      # api cannot start if Mongo is down
+ls -ldn logs uploads images data-node   # ownership per the table above
+```
+From nginx's perspective:
+- `wget: bad address 'api:3080'` → the container is not on `librechat_default` (usually because
+  it is crash-looping and never joined).
+- `Connection refused` → it is on the network but not listening: either still starting (allow
+  30–60s) or dying on startup.
+
+### Restarting after config/env changes
+For LibreChat-only config changes:
+```bash
 docker compose up -d --force-recreate api
 ```
-Document any React/source change here under "What this fork changes vs upstream" so the diff
-from stock v0.8.7 stays legible.
+For a full-stack restart, **do not name services individually** — services added later
+(mask-proxy, stats-app, feedback-admin, ocr-service, searxng, …) would be left behind:
+```bash
+docker compose down && docker compose up -d
+```
+After any `down`, confirm with `docker ps` that everything you expect is actually back.
+
+---
 
 ## Upstream / updates
 `origin` = this fork (`UD-FSAII/...`), `upstream` = `danny-avila/LibreChat`. We're pinned at

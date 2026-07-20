@@ -1,0 +1,116 @@
+version: 1.3.13
+cache: true
+ocr:
+  strategy: "mistral_ocr"
+  apiKey: "placeholder"          # any value; Tesseract ignores it
+  baseURL: "http://ocr-service:8003/v1" #baseURL: "http://172.22.0.1:8003/v1"
+memory:
+  disabled: true         # completely disables memory
+fileConfig:
+  endpoints:
+    vLLM:                          # matches your custom endpoint name exactly
+      fileLimit: 5
+      fileSizeLimit: 35            # MB per file
+      totalSizeLimit: 50
+      supportedMimeTypes:
+        - "^image/(jpeg|png|gif|webp)$"              # permits images → sent to the model as vision input
+        - "application/pdf"
+         # Word, PowerPoint, Excel (modern .docx/.pptx/.xlsx):
+        - "application/vnd\\.openxmlformats-officedocument\\..*"
+        # Legacy Office (.doc/.ppt/.xls):
+        - "application/vnd\\.ms-(word|powerpoint|excel)$"
+        # Plain text / CSV / markdown:
+        - "text/.*"
+  ocr:
+    supportedMimeTypes:
+      - "^application/pdf$"
+      - "^image/(jpeg|gif|png|webp|heic|heif)$"
+      - "^application/vnd\\.openxmlformats-officedocument\\.(wordprocessingml\\.document|presentationml\\.presentation|spreadsheetml\\.sheet)$"
+      - "^application/vnd\\.ms-(word|powerpoint|excel)$"
+  serverFileSizeLimit: 100
+interface:
+  agents: false        # removes the Agents endpoint/button
+  fileSearch: true       # enables the "Upload for File Search" chat-area option
+  webSearch: true
+  modelSelect: false      # keep the model/endpoint selector visible
+  endpointsMenu: false 
+  parameters: false       # ← brings back the parameters/settings panel
+  presets: true          # ← lets users save/tweak presets
+  multiConvo: false 
+  sharedLinks: false        # disable public conversation sharing
+  agentApiKeys: false       # disable user-generated agent API keys
+
+  memories: false
+  customWelcome: "Welcome to UD Assistant! \n To analyze an image, click the 📎 attachment icon and choose 'Upload to Provider'."
+endpoints:
+  agents:
+    disableBuilder: true          # keep the agent builder hidden (simplified UI)
+    recursionLimit: 20
+    maxRecursionLimit: 25
+    capabilities:
+      - "file_search"             # surfaces "Upload for File Search" (RAG)
+      - "context"                 # surfaces "Upload as Text"
+      - "ocr"                     # optional: better text extraction from scans
+      - "web_search"
+      - "artifacts" 
+ 
+  custom:
+    - name: "vLLM"
+      apiKey: "${VLLM_API_KEY}"
+      baseURL: "http://172.22.0.1:8000/v1" #"http://vllm-lb:8000/v1" for nginx      
+      models:
+        default: ["Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"]
+        fetch: true
+      titleConvo: true
+      titleModel: "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
+      modelDisplayLabel: "Qwen3-30B"
+      maxContextTokens: 180000 
+      addParams:
+        temperature: 0.1      # new lower default; user slider still overrides this
+        max_tokens: 10000
+modelSpecs:
+  enforce: true        # false = your prompt is the DEFAULT, users can still tweak params
+  prioritize: true      # this spec is the default selection on new chats
+  list:
+    - name: "ud-assistant"
+      label: "UD Assistant"
+      default: true
+      description: "University of Delaware assistant"
+      webSearch: true 
+      fileSearch: true 
+      artifacts: true
+      preset:
+        endpoint: "vLLM"                                   # MUST match your custom endpoint name exactly
+        model: "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
+        temperature: 0.1                                   # lower default temperature
+        promptPrefix: |
+          Your job is to give the user a correct, complete answer. Producing an answer is mandatory; tool calls are just a means to that end.
+
+          === WHEN TO SEARCH ===
+          FACTUAL (specific people, "who is/are", job titles, leadership, office-holders, current events, dates, prices, statistics, or anything that may have changed since your training): you MUST call web_search first — never answer these from memory. Answer only from the results. If the search doesn't clearly answer it, say you couldn't confirm it — do NOT guess.
+
+          GROUNDED-GENERATIVE (diagrams, summaries, or explanations about a real institution, program, or process): do one quick search to ground it, then produce the output.
+
+          PURELY CREATIVE (generic writing, code, math, concept explanations, poems): answer directly, NO search.
+
+          UPLOADED DOCUMENTS: answer from the document itself, not the web.
+
+          === TOOL-CALL BUDGET (prevents loops) ===
+          - You have a limited number of tool calls per response. Always reserve enough to write your final answer — never spend them all.
+          - Never run the SAME search twice. If a search returns little, do NOT repeat it — use what you have.
+          - For a single question, one or two searches is normal. For an explicit multi-part request ("look up each of these separately"), you may search once per item, but no more.
+          - After gathering information, STOP calling tools and write your answer — even if incomplete. A partial answer that notes what you couldn't verify is far better than continuing to call tools and failing with an error.
+
+          === LIMITS ON WHAT YOU CAN DO ===
+          You cannot perfectly reproduce logos, trademarks, or exact visual designs of real organizations. If asked to recreate a specific logo and told it's wrong, do NOT keep searching — acknowledge you can't reliably reproduce it and offer an original design instead.
+
+          When producing Mermaid diagrams: begin with "flowchart TD", keep node labels short and plain, avoid parentheses/colons/quotes in node text, and ensure valid syntax.
+
+webSearch:
+  searchProvider: "searxng"
+  searxngInstanceUrl: "${SEARXNG_INSTANCE_URL}"
+  scraperProvider: "firecrawl"
+  firecrawlApiKey: "${FIRECRAWL_API_KEY}"
+  firecrawlApiUrl: "${FIRECRAWL_API_URL}"
+  rerankerType: "none"
+
