@@ -222,6 +222,16 @@ After any `down`, confirm with `docker ps` that everything you expect is actuall
 
 ---
 
+- **Port not published to the host** — `docker-compose.yml` line 8 (`- "${PORT}:${PORT}"`)
+  is commented out. LibreChat is reachable only over the `librechat_default` docker network
+  as `http://api:3080`, with nginx as the sole entry point. This closes a real exposure:
+  previously the container bound `0.0.0.0:3080`, so anyone on the university network could
+  reach LibreChat directly, bypassing TLS.
+  *Note:* this had to be done in the **base** compose, not the override. Compose **appends**
+  list-valued keys like `ports` across files rather than replacing them, so neither
+  `ports: []` nor a loopback entry in the override can remove a base mapping.
+  Health check from the host: `docker exec https-proxy wget -qO- http://api:3080/health`
+
 ## Upstream / updates
 `origin` = this fork (`UD-FSAII/...`), `upstream` = `danny-avila/LibreChat`. We're pinned at
 v0.8.7 + our commits and do not auto-track. To pull a specific upstream security fix, cherry-pick

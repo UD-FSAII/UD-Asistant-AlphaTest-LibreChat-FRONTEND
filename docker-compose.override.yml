@@ -34,9 +34,10 @@ services:
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
       - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
       - LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL}
-  # admin-panel:
-  #     ports:
-  #       - "127.0.0.1:3004:3000"
+  admin-panel:
+      profiles: ["admin"]
+      ports:
+        - "127.0.0.1:3004:3000"
 
   rag_api:
     image: rag-api-ocr:local
