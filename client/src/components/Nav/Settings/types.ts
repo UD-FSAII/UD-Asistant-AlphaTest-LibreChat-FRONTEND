@@ -104,17 +104,24 @@ export const TABS: TabMeta[] = [
       { id: 'tts', labelKey: 'com_ui_settings_section_tts' },
     ],
   },
-  {
-    id: SettingsTabValues.DATA,
-    labelKey: 'com_ui_settings_tab_data',
-    icon: createElement(DataIcon),
-    sections: [
-      { id: 'memory', labelKey: 'com_ui_settings_section_memory' },
-      { id: 'data', labelKey: 'com_ui_settings_section_data' },
-      { id: 'apiKeys', labelKey: 'com_ui_settings_section_api_keys' },
-      { id: 'danger', labelKey: 'com_ui_settings_section_danger_zone', danger: true },
-    ],
-  },
+/**
+   * UD Assistant customization: Data & Privacy tab hidden.
+   * Removes memory controls, import conversations, shared links, API key
+   * management, and the danger zone (delete cache / clear chats) from the
+   * settings dialog. The registry entries in Settings/registry.tsx remain but
+   * have no tab to render into. Restore this block to bring the tab back.
+   */
+  // {
+  //   id: SettingsTabValues.DATA,
+  //   labelKey: 'com_ui_settings_tab_data',
+  //   icon: createElement(DataIcon),
+  //   sections: [
+  //     { id: 'memory', labelKey: 'com_ui_settings_section_memory' },
+  //     { id: 'data', labelKey: 'com_ui_settings_section_data' },
+  //     { id: 'apiKeys', labelKey: 'com_ui_settings_section_api_keys' },
+  //     { id: 'danger', labelKey: 'com_ui_settings_section_danger_zone', danger: true },
+  //   ],
+  // },
   {
     id: SettingsTabValues.ACCOUNT,
     labelKey: 'com_nav_setting_account',

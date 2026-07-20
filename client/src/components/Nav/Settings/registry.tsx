@@ -53,14 +53,19 @@ export const registry: SettingEntry[] = [
     keywords: ['dark', 'light', 'appearance', 'color'],
     Component: ThemeSetting,
   },
-  {
-    id: 'language',
-    tab: GENERAL,
-    section: 'appearance',
-    labelKey: 'com_nav_language',
-    keywords: ['locale', 'translation'],
-    Component: LangSetting,
-  },
+/**
+   * UD Assistant customization: language selector removed (English-only beta).
+   * `defaultLang()` in client/src/store/language.ts is pinned to 'en'.
+   * Restore this entry to bring the selector back.
+   */
+  // {
+  //   id: 'language',
+  //   tab: GENERAL,
+  //   section: 'appearance',
+  //   labelKey: 'com_nav_language',
+  //   keywords: ['locale', 'translation'],
+  //   Component: LangSetting,
+  // },
   {
     id: 'fontSize',
     tab: GENERAL,

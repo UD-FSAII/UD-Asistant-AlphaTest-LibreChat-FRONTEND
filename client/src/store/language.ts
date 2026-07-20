@@ -20,13 +20,14 @@ const readStoredLang = () => {
   }
 };
 
-const defaultLang = () => {
-  const userLang =
-    (typeof navigator !== 'undefined' ? navigator.language || navigator.languages?.[0] : null) ??
-    'en';
-  return Cookies.get('lang') || readStoredLang() || userLang;
-};
-
+/**
+ * UD Assistant customization: the interface is English-only.
+ * Upstream falls back to the browser locale (and any stored/cookie value), which
+ * would show a non-English UI to users whose browser is set to another language.
+ * Since the language selector is hidden (see Nav/Settings/controls.tsx), that would
+ * leave them stuck. Force 'en' unconditionally.
+ */
+const defaultLang = () => 'en';
 const lang = atomWithLocalStorage('lang', defaultLang());
 const languageLoading = atom<boolean>({
   key: 'languageLoading',

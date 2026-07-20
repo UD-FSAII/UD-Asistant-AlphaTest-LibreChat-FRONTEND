@@ -41,7 +41,7 @@ interface:
   agentApiKeys: false       # disable user-generated agent API keys
 
   memories: false
-  customWelcome: "Welcome to UD Assistant! \n To analyze an image, click the 📎 attachment icon and choose 'Upload to Provider'."
+  customWelcome: "Welcome to UD Assistant. Ask a question, upload a document, or share an image to get started.."
 endpoints:
   agents:
     disableBuilder: true          # keep the agent builder hidden (simplified UI)
