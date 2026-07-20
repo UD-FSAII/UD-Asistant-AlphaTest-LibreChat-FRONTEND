@@ -68,6 +68,7 @@ endpoints:
       addParams:
         temperature: 0.1      # new lower default; user slider still overrides this
         max_tokens: 10000
+        streamUsage: true          # restore token accounting
 modelSpecs:
   enforce: true        # false = your prompt is the DEFAULT, users can still tweak params
   prioritize: true      # this spec is the default selection on new chats

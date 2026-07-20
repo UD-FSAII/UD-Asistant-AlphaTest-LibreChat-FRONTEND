@@ -12,6 +12,7 @@ import SiblingSwitch from '~/components/Chat/Messages/SiblingSwitch';
 import HoverButtons from '~/components/Chat/Messages/HoverButtons';
 import MessageIcon from '~/components/Chat/Messages/MessageIcon';
 import SubRow from '~/components/Chat/Messages/SubRow';
+import TokenFooter from '~/components/Chat/Messages/TokenFooter';
 import { fontSizeAtom } from '~/store/fontSize';
 import store from '~/store';
 
@@ -255,6 +256,7 @@ const ContentRender = memo(function ContentRender({
                 handleFeedback={handleFeedback}
                 isLast={isLast}
               />
+              <TokenFooter message={msg} />
             </SubRow>
           )}
         </div>
