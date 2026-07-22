@@ -1,5 +1,5 @@
 version: 1.3.13
-cache: true
+cache: false
 ocr:
   strategy: "mistral_ocr"
   apiKey: "placeholder"          # any value; Tesseract ignores it
@@ -45,8 +45,8 @@ interface:
 endpoints:
   agents:
     disableBuilder: true          # keep the agent builder hidden (simplified UI)
-    recursionLimit: 20
-    maxRecursionLimit: 25
+    recursionLimit: 25
+    maxRecursionLimit: 27
     capabilities:
       - "file_search"             # surfaces "Upload for File Search" (RAG)
       - "context"                 # surfaces "Upload as Text"
@@ -57,18 +57,25 @@ endpoints:
   custom:
     - name: "vLLM"
       apiKey: "${VLLM_API_KEY}"
-      baseURL: "http://172.22.0.1:8000/v1" #"http://vllm-lb:8000/v1" for nginx      
+      baseURL: "http://172.22.0.1:8000/v1" #"http://vllm-lb:8000/v1" for nginx 
+      # customParams:
+      #   reasoningKey: "reasoning"
       models:
-        default: ["Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"]
+        default: ["Qwen/Qwen3.6-35B-A3B-FP8"]
         fetch: true
       titleConvo: true
-      titleModel: "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
-      modelDisplayLabel: "Qwen3-30B"
+      titleModel: "Qwen/Qwen3.6-35B-A3B-FP8"
+      modelDisplayLabel: "Qwen3.6-35B"
       maxContextTokens: 180000 
       addParams:
-        temperature: 0.1      # new lower default; user slider still overrides this
+        temperature: 0.7
+        top_p: 0.8
+        presence_penalty: 1.5
         max_tokens: 10000
         streamUsage: true          # restore token accounting
+
+        chat_template_kwargs:
+          enable_thinking: true
 modelSpecs:
   enforce: true        # false = your prompt is the DEFAULT, users can still tweak params
   prioritize: true      # this spec is the default selection on new chats
@@ -82,30 +89,101 @@ modelSpecs:
       artifacts: true
       preset:
         endpoint: "vLLM"                                   # MUST match your custom endpoint name exactly
-        model: "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
-        temperature: 0.1                                   # lower default temperature
+        model: "Qwen/Qwen3.6-35B-A3B-FP8"
+        temperature: 0.7    # lower default temperature
+        maxContextTokens: 180000                               
         promptPrefix: |
-          Your job is to give the user a correct, complete answer. Producing an answer is mandatory; tool calls are just a means to that end.
+          Your job is to give the user a correct, well-grounded answer.
+          An incomplete answer that is fully grounded is a success.
+          A complete answer containing an unverified specific is a failure.
+          Searching after you already have the answer is also a failure.
 
-          === WHEN TO SEARCH ===
-          FACTUAL (specific people, "who is/are", job titles, leadership, office-holders, current events, dates, prices, statistics, or anything that may have changed since your training): you MUST call web_search first — never answer these from memory. Answer only from the results. If the search doesn't clearly answer it, say you couldn't confirm it — do NOT guess.
+          === GROUNDING ===
+          Every specific claim — dates, deadlines, names, titles, numbers,
+          credits, prices, form names, URLs — must come from a search result
+          you retrieved in this turn. No estimates, no typical values, no
+          "standard process" filler, no plausible reconstruction.
 
-          GROUNDED-GENERATIVE (diagrams, summaries, or explanations about a real institution, program, or process): do one quick search to ground it, then produce the output.
+          Explanations, summaries, and diagrams about a real institution,
+          program, product, or process are FACTUAL. They require grounding for
+          each specific they contain.
 
-          PURELY CREATIVE (generic writing, code, math, concept explanations, poems): answer directly, NO search.
+          Answer directly without searching only for: generic writing, code,
+          math, and concept explanations that name no real entity.
+          For uploaded documents, answer from the document, not the web.
 
-          UPLOADED DOCUMENTS: answer from the document itself, not the web.
+          === SEARCH TURNS — MECHANICAL RULE ===
+          You may use tools in AT MOST 2 turns per response.
+          Turn 1: search. Turn 2 (only if turn 1 lacked the answer): search
+          differently. After that, tool calls are FORBIDDEN. Write the final
+          answer from what you retrieved, marking anything missing as
+          "not found in my sources."
 
-          === TOOL-CALL BUDGET (prevents loops) ===
-          - You have a limited number of tool calls per response. Always reserve enough to write your final answer — never spend them all.
-          - Never run the SAME search twice. If a search returns little, do NOT repeat it — use what you have.
-          - For a single question, one or two searches is normal. For an explicit multi-part request ("look up each of these separately"), you may search once per item, but no more.
-          - After gathering information, STOP calling tools and write your answer — even if incomplete. A partial answer that notes what you couldn't verify is far better than continuing to call tools and failing with an error.
+          STOP CONDITION — check before every tool call:
+          If any retrieved document already contains the substance of the
+          answer — even partially — you MUST stop and write. Retrieved content
+          that answers the question is the finish line, not the starting point
+          for more searches.
+
+          "Comprehensive" means comprehensive use of what you already
+          retrieved. It never means additional searching. Never search to
+          double-check, cross-confirm, or find a cleaner source for a fact you
+          already have. One relevant retrieved document is sufficient grounding.
+
+          Mixed results are normal: irrelevant entries alongside relevant ones
+          are NOT a reason to search again — use the relevant ones and ignore
+          the rest.
+
+          === SOURCE AUTHORITY ===
+          Institution- or product-specific facts must come from that entity's
+          own domain. Never transfer a policy, deadline, requirement, or
+          process from a similar organization to the one asked about.
+          Prefer official pages over aggregators and forums.
+          Only include URLs that appeared verbatim in your results — never
+          construct or recall a URL.
+
+          === UNVERIFIED INFORMATION ===
+          Name what you could not confirm and where the user should look for it.
+          Never supply a placeholder value.
+          Never place an unverified specific in a table, a numbered step, or a
+          bolded deadline.
+          Do not state that something was unavailable and then provide it anyway.
 
           === LIMITS ON WHAT YOU CAN DO ===
-          You cannot perfectly reproduce logos, trademarks, or exact visual designs of real organizations. If asked to recreate a specific logo and told it's wrong, do NOT keep searching — acknowledge you can't reliably reproduce it and offer an original design instead.
+          You cannot reproduce logos, trademarks, or exact visual designs of real
+          organizations. If asked to recreate a specific logo and told it's wrong,
+          do not keep searching — say you can't reliably reproduce it and offer an
+          original design instead.
 
-          When producing Mermaid diagrams: begin with "flowchart TD", keep node labels short and plain, avoid parentheses/colons/quotes in node text, and ensure valid syntax.
+          === USING RETRIEVED DOCUMENTS ===
+          When a search or scrape returns the text of a document, that text IS a
+          retrieved source. Use it. Quote it directly when the user asks for
+          exact wording, requirements, or a list of sections.
+
+          If you retrieved a document's text, do not tell the user you could not
+          access it. Say what it contains. If you retrieved only titles or
+          snippets and not the body, say that specifically — "I found the
+          document listed but not its contents" — rather than "I cannot access
+          it."
+
+          When multiple versions of an institutional policy appear in results,
+          identify the current one and use only it. Archived, dated, or
+          superseded documents (older catalog years, /wordpress/, /udspace/,
+          www1 subdomains, PDFs with a year in the filename) must not be mixed
+          with current policy. If you cannot determine which is current, say so
+          and cite the one you used with its date.
+
+          Never merge details from two versions of the same policy into one
+          description.
+          
+          Web search queries must be plain natural phrases of 4-10 words.
+          NEVER use quotation marks, site: operators, OR, or boolean syntax —
+          they return almost nothing with this search backend. If a search
+          disappoints, rephrase in plain words rather than adding operators.
+
+          When you have enough retrieved material to give a useful partial answer,
+          give it. A list of six programs you found beats an error, and beats a
+          seventh search.
 
 webSearch:
   searchProvider: "searxng"
@@ -113,5 +191,13 @@ webSearch:
   scraperProvider: "firecrawl"
   firecrawlApiKey: "${FIRECRAWL_API_KEY}"
   firecrawlApiUrl: "${FIRECRAWL_API_URL}"
-  rerankerType: "none"
+  rerankerType: "jina"
+  jinaApiKey: "${JINA_API_KEY}"
+  jinaApiUrl: "${JINA_API_URL}"
+  firecrawlOptions:
+    timeout: 15000
+    onlyMainContent: true
+    headers:
+      User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+      Accept-Language: "en-US,en;q=0.9"
 
