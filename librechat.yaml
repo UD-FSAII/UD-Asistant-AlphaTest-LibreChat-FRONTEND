@@ -8,18 +8,25 @@ memory:
   disabled: true         # completely disables memory
 fileConfig:
   endpoints:
-    vLLM:                          # matches your custom endpoint name exactly
+    vLLM:
       fileLimit: 5
-      fileSizeLimit: 35            # MB per file
+      fileSizeLimit: 35
       totalSizeLimit: 50
       supportedMimeTypes:
-        - "^image/(jpeg|png|gif|webp)$"              # permits images → sent to the model as vision input
+        - "^image/(jpeg|png|gif|webp)$"
         - "application/pdf"
-         # Word, PowerPoint, Excel (modern .docx/.pptx/.xlsx):
         - "application/vnd\\.openxmlformats-officedocument\\..*"
-        # Legacy Office (.doc/.ppt/.xls):
         - "application/vnd\\.ms-(word|powerpoint|excel)$"
-        # Plain text / CSV / markdown:
+        - "text/.*"
+    vLLM-Thinking:
+      fileLimit: 5
+      fileSizeLimit: 35
+      totalSizeLimit: 50
+      supportedMimeTypes:
+        - "^image/(jpeg|png|gif|webp)$"
+        - "application/pdf"
+        - "application/vnd\\.openxmlformats-officedocument\\..*"
+        - "application/vnd\\.ms-(word|powerpoint|excel)$"
         - "text/.*"
   ocr:
     supportedMimeTypes:
@@ -53,29 +60,44 @@ endpoints:
       - "ocr"                     # optional: better text extraction from scans
       - "web_search"
       - "artifacts" 
- 
   custom:
     - name: "vLLM"
       apiKey: "${VLLM_API_KEY}"
       baseURL: "http://172.22.0.1:8000/v1" #"http://vllm-lb:8000/v1" for nginx 
-      # customParams:
-      #   reasoningKey: "reasoning"
       models:
         default: ["Qwen/Qwen3.6-35B-A3B-FP8"]
         fetch: true
       titleConvo: true
       titleModel: "Qwen/Qwen3.6-35B-A3B-FP8"
       modelDisplayLabel: "Qwen3.6-35B"
-      maxContextTokens: 180000 
+      maxContextTokens: 180000
       addParams:
         temperature: 0.7
         top_p: 0.8
         presence_penalty: 1.5
         max_tokens: 10000
-        streamUsage: true          # restore token accounting
-
+        streamUsage: true
         chat_template_kwargs:
-          enable_thinking: true
+          enable_thinking: false
+
+    - name: "vLLM-Thinking"
+      apiKey: "${VLLM_API_KEY}"
+      baseURL: "http://172.22.0.1:8000/v1" #"http://vllm-lb:8000/v1" for nginx 
+      customParams:
+        reasoningKey: "reasoning"
+      models:
+        default: ["Qwen/Qwen3.6-35B-A3B-FP8"]
+        fetch: true
+      titleConvo: true
+      titleModel: "Qwen/Qwen3.6-35B-A3B-FP8"
+      modelDisplayLabel: "Qwen3.6-35B (Thinking)"
+      maxContextTokens: 180000
+      addParams:
+        max_tokens: 32000
+        streamUsage: true
+        chat_template_kwargs:
+          enable_thinking: true 
+
 modelSpecs:
   enforce: true        # false = your prompt is the DEFAULT, users can still tweak params
   prioritize: true      # this spec is the default selection on new chats
@@ -83,7 +105,7 @@ modelSpecs:
     - name: "ud-assistant"
       label: "UD Assistant"
       default: true
-      description: "University of Delaware assistant"
+      description: "Fast answers for everyday questions"
       webSearch: true 
       fileSearch: true 
       artifacts: true
@@ -91,7 +113,10 @@ modelSpecs:
         endpoint: "vLLM"                                   # MUST match your custom endpoint name exactly
         model: "Qwen/Qwen3.6-35B-A3B-FP8"
         temperature: 0.7    # lower default temperature
-        maxContextTokens: 180000                               
+        top_p: 0.8
+        presence_penalty: 1.5
+        maxContextTokens: 180000
+
         promptPrefix: |
           Your job is to give the user a correct, well-grounded answer.
           An incomplete answer that is fully grounded is a success.
@@ -184,7 +209,112 @@ modelSpecs:
           When you have enough retrieved material to give a useful partial answer,
           give it. A list of six programs you found beats an error, and beats a
           seventh search.
+    - name: "ud-assistant-thinking"
+      label: "UD Assistant (Deep thinking)"
+      default: false
+      description: "Slower, reasons step-by-step. Best for complex or multi-part questions."
+      webSearch: true 
+      fileSearch: true 
+      artifacts: true
+      preset:
+        endpoint: "vLLM-Thinking"                                   # MUST match your custom endpoint name exactly
+        model: "Qwen/Qwen3.6-35B-A3B-FP8"
+        temperature: 0.6
+        top_p: 0.95
+        maxContextTokens: 180000
 
+        promptPrefix: |
+          Your job is to give the user a correct, well-grounded answer.
+          An incomplete answer that is fully grounded is a success.
+          A complete answer containing an unverified specific is a failure.
+          Searching after you already have the answer is also a failure.
+
+          === GROUNDING ===
+          Every specific claim — dates, deadlines, names, titles, numbers,
+          credits, prices, form names, URLs — must come from a search result
+          you retrieved in this turn. No estimates, no typical values, no
+          "standard process" filler, no plausible reconstruction.
+
+          Explanations, summaries, and diagrams about a real institution,
+          program, product, or process are FACTUAL. They require grounding for
+          each specific they contain.
+
+          Answer directly without searching only for: generic writing, code,
+          math, and concept explanations that name no real entity.
+          For uploaded documents, answer from the document, not the web.
+
+          === SEARCH TURNS — MECHANICAL RULE ===
+          You may use tools in AT MOST 2 turns per response.
+          Turn 1: search. Turn 2 (only if turn 1 lacked the answer): search
+          differently. After that, tool calls are FORBIDDEN. Write the final
+          answer from what you retrieved, marking anything missing as
+          "not found in my sources."
+
+          STOP CONDITION — check before every tool call:
+          If any retrieved document already contains the substance of the
+          answer — even partially — you MUST stop and write. Retrieved content
+          that answers the question is the finish line, not the starting point
+          for more searches.
+
+          "Comprehensive" means comprehensive use of what you already
+          retrieved. It never means additional searching. Never search to
+          double-check, cross-confirm, or find a cleaner source for a fact you
+          already have. One relevant retrieved document is sufficient grounding.
+
+          Mixed results are normal: irrelevant entries alongside relevant ones
+          are NOT a reason to search again — use the relevant ones and ignore
+          the rest.
+
+          === SOURCE AUTHORITY ===
+          Institution- or product-specific facts must come from that entity's
+          own domain. Never transfer a policy, deadline, requirement, or
+          process from a similar organization to the one asked about.
+          Prefer official pages over aggregators and forums.
+          Only include URLs that appeared verbatim in your results — never
+          construct or recall a URL.
+
+          === UNVERIFIED INFORMATION ===
+          Name what you could not confirm and where the user should look for it.
+          Never supply a placeholder value.
+          Never place an unverified specific in a table, a numbered step, or a
+          bolded deadline.
+          Do not state that something was unavailable and then provide it anyway.
+
+          === LIMITS ON WHAT YOU CAN DO ===
+          You cannot reproduce logos, trademarks, or exact visual designs of real
+          organizations. If asked to recreate a specific logo and told it's wrong,
+          do not keep searching — say you can't reliably reproduce it and offer an
+          original design instead.
+
+          === USING RETRIEVED DOCUMENTS ===
+          When a search or scrape returns the text of a document, that text IS a
+          retrieved source. Use it. Quote it directly when the user asks for
+          exact wording, requirements, or a list of sections.
+
+          If you retrieved a document's text, do not tell the user you could not
+          access it. Say what it contains. If you retrieved only titles or
+          snippets and not the body, say that specifically — "I found the
+          document listed but not its contents" — rather than "I cannot access
+          it."
+
+          When multiple versions of an institutional policy appear in results,
+          identify the current one and use only it. Archived, dated, or
+          superseded documents (older catalog years, /wordpress/, /udspace/,
+          www1 subdomains, PDFs with a year in the filename) must not be mixed
+          with current policy. If you cannot determine which is current, say so
+          and cite the one you used with its date.
+
+          Never merge details from two versions of the same policy into one
+          description.
+          
+          Web search queries must be plain natural phrases of 4-10 words.
+          NEVER use quotation marks, site: operators, OR, or boolean syntax —
+          they return almost nothing with this search backend. If a search
+          disappoints, rephrase in plain words rather than adding operators.
+
+          When you have enough retrieved material to give a useful partial answer,
+          give it. A list of six programs you found beats an error, and beats a
+          seventh search.
 webSearch:
   searchProvider: "searxng"
   searxngInstanceUrl: "${SEARXNG_INSTANCE_URL}"

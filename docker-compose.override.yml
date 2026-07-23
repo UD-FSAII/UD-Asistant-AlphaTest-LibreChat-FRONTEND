@@ -20,6 +20,9 @@ services:
       - ./client/public/assets/favicon-32x32.png:/app/client/dist/assets/favicon-32x32.png
       - ./client/public/assets/apple-touch-icon-180x180.png:/app/client/dist/assets/apple-touch-icon-180x180.png
       - ./client/public/assets/icon-192x192.png:/app/client/dist/assets/icon-192x192.png
+      - ./patches/stream.cjs:/app/node_modules/@librechat/agents/dist/cjs/stream.cjs:ro
+      - ./patches/completions.js:/app/node_modules/@langchain/openai/dist/converters/completions.js:ro
+      - ./patches/completions.cjs:/app/node_modules/@langchain/openai/dist/converters/completions.cjs:ro
       # - ./index.html:/app/client/dist/index.html
     extra_hosts:
       - "host.docker.internal:host-gateway"
