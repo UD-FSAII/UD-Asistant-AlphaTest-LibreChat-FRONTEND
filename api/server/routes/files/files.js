@@ -34,7 +34,11 @@ const { cleanFileName, getContentDisposition } = require('~/server/utils/files')
 const { getLogStores } = require('~/cache');
 const { Readable } = require('stream');
 const db = require('~/models');
-
+const {
+  getUserStorageUsage,
+  getStorageLimit,
+  assertWithinStorageQuota,
+} = require('~/server/services/Files/quota'); 
 const router = express.Router();
 
 router.get('/', async (req, res) => {
@@ -125,6 +129,16 @@ router.get('/config', async (req, res) => {
   } catch (error) {
     logger.error('[/files] Error getting fileConfig', error);
     res.status(400).json({ message: 'Error in request', error: error.message });
+  }
+});
+
+router.get('/usage', async (req, res) => {
+  try {
+    const used = await getUserStorageUsage(req.user.id);
+    res.status(200).json({ used, limit: getStorageLimit() });
+  } catch (error) {
+    logger.error('[/files/usage] Error getting storage usage:', error);
+    res.status(500).json({ message: 'Error fetching storage usage' });
   }
 });
 
@@ -615,7 +629,18 @@ router.post('/', async (req, res) => {
 
   try {
     filterFile({ req });
-
+    try {
+      await assertWithinStorageQuota(req);
+    } catch (quotaError) {
+      logger.info(`[/files] Upload rejected (quota): ${quotaError.message}`);
+      try {
+        await fs.unlink(req.file.path);
+      } catch (unlinkError) {
+        logger.error('[/files] Error deleting rejected upload:', unlinkError);
+      }
+      cleanup = false;
+      return res.status(413).json({ message: quotaError.message });
+    }
     metadata.temp_file_id = metadata.file_id;
     metadata.file_id = req.file_id;
 

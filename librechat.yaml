@@ -52,8 +52,8 @@ interface:
 endpoints:
   agents:
     disableBuilder: true          # keep the agent builder hidden (simplified UI)
-    recursionLimit: 25
-    maxRecursionLimit: 27
+    recursionLimit: 20
+    maxRecursionLimit: 22
     capabilities:
       - "file_search"             # surfaces "Upload for File Search" (RAG)
       - "context"                 # surfaces "Upload as Text"
@@ -72,11 +72,15 @@ endpoints:
       modelDisplayLabel: "Qwen3.6-35B"
       maxContextTokens: 180000
       addParams:
+        modelKwargs:
+            parallel_tool_calls: false
         temperature: 0.7
         top_p: 0.8
         presence_penalty: 1.5
         max_tokens: 10000
         streamUsage: true
+        extra_body:
+          top_k: 20
         chat_template_kwargs:
           enable_thinking: false
 
@@ -93,6 +97,8 @@ endpoints:
       modelDisplayLabel: "Qwen3.6-35B (Thinking)"
       maxContextTokens: 180000
       addParams:
+        modelKwargs:
+            parallel_tool_calls: false
         max_tokens: 32000
         temperature: 0.6
         top_p: 0.95
@@ -100,6 +106,8 @@ endpoints:
         min_p: 0
         presence_penalty: 1.05
         streamUsage: true
+        extra_body:
+          top_k: 20
         chat_template_kwargs:
           enable_thinking: true 
 
@@ -222,7 +230,7 @@ modelSpecs:
           report events you believe are in the future, the results are right.
 
           === SEARCHING ===
-          At most 2 tool turns per response. Turn 1: search. Turn 2 (only if turn 1
+          At most 2 searches per query. Search 1: search. Search 2 (only if the first search 
           lacked the answer): search differently. Then tool calls are FORBIDDEN — write
           the answer, marking gaps as "not found in my sources."
 
@@ -250,6 +258,16 @@ modelSpecs:
           archived/dated sources (older catalog years, /wordpress/, /udspace/, www1,
           year-stamped PDFs) as superseded. Never merge two versions into one
           description. If you can't tell which is current, say so and date what you used.
+          
+          If your reasoning identifies information you could not retrieve, that
+          gap MUST appear in your final answer as an explicit statement of what
+          you could not confirm. You may not resolve an unfilled gap by writing
+          the content anyway. Reasoning that concludes "I need X to be complete"
+          and does not obtain X must produce an answer that omits X and says so.
+
+          If a question is ambiguous between two programs or levels, answer the
+          part you have sourced and ask which the user needs. Do not fabricate
+          the other branch to appear complete.
 
           === WHAT YOU WON'T DO ===
           Name what you couldn't confirm and where to look. Never supply placeholder

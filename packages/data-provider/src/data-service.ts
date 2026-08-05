@@ -459,6 +459,10 @@ export const getFileConfig = (): Promise<TFileConfig> => {
   return request.get(`${endpoints.files()}/config`);
 };
 
+export const getStorageUsage = (): Promise<{ used: number; limit: number }> => {
+  return request.get(endpoints.fileStorageUsage());
+};
+
 export const uploadImage = (
   data: FormData,
   signal?: AbortSignal | null,

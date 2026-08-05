@@ -14,6 +14,7 @@ import { useGetFileConfig, useGetEndpointsQuery, useGetAgentByIdQuery } from '~/
 import { useAgentsMapContext } from '~/Providers';
 import AttachFileMenu from './AttachFileMenu';
 import AttachFile from './AttachFile';
+import StorageIndicator from './StorageIndicator';
 
 function AttachFileChat({
   disableInputs,
@@ -99,32 +100,38 @@ function AttachFileChat({
 
   if (isAssistants && endpointSupportsFiles && !isUploadDisabled) {
     return (
-      <AttachFile
-        disabled={disableInputs}
-        files={files}
-        setFiles={setFiles}
-        setFilesLoading={setFilesLoading}
-        conversation={conversation}
-      />
+      <>
+        <AttachFile
+          disabled={disableInputs}
+          files={files}
+          setFiles={setFiles}
+          setFilesLoading={setFilesLoading}
+          conversation={conversation}
+        />
+        <StorageIndicator />
+      </>
     );
   } else if ((isAgents || endpointSupportsFiles) && !isUploadDisabled) {
     return (
-      <AttachFileMenu
-        endpoint={endpoint}
-        disabled={disableInputs}
-        endpointType={endpointType}
-        conversationId={conversationId}
-        agentId={conversation?.agent_id}
-        endpointFileConfig={endpointFileConfig}
-        useResponsesApi={useResponsesApi}
-        files={files}
-        setFiles={setFiles}
-        setFilesLoading={setFilesLoading}
-        conversation={conversation}
-      />
+      <>
+        <AttachFileMenu
+          endpoint={endpoint}
+          disabled={disableInputs}
+          endpointType={endpointType}
+          conversationId={conversationId}
+          agentId={conversation?.agent_id}
+          endpointFileConfig={endpointFileConfig}
+          useResponsesApi={useResponsesApi}
+          files={files}
+          setFiles={setFiles}
+          setFilesLoading={setFilesLoading}
+          conversation={conversation}
+        />
+        <StorageIndicator />
+      </>
     );
   }
-  return null;
+  return StorageIndicator;
 }
 
 export default memo(AttachFileChat);

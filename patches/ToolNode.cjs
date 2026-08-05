@@ -1,0 +1,2187 @@
+const require_langfuseRuntimeScope = require("../langfuseRuntimeScope.cjs");
+const require_enum = require("../common/enum.cjs");
+require("../common/index.cjs");
+const require_langchain = require("../messages/langchain.cjs");
+const require_truncation = require("../utils/truncation.cjs");
+const require_events = require("../utils/events.cjs");
+const require_eagerEventExecution = require("./eagerEventExecution.cjs");
+const require_toolOutputReferences = require("./toolOutputReferences.cjs");
+const require_run = require("../utils/run.cjs");
+require("../utils/index.cjs");
+const require_CodeSessionFileSummary = require("./CodeSessionFileSummary.cjs");
+const require_executeHooks = require("../hooks/executeHooks.cjs");
+require("../hooks/index.cjs");
+const require_resolveLocalExecutionTools = require("./local/resolveLocalExecutionTools.cjs");
+require("./local/index.cjs");
+let _langchain_core_messages = require("@langchain/core/messages");
+let _langchain_langgraph = require("@langchain/langgraph");
+let _langchain_core_singletons = require("@langchain/core/singletons");
+//#region src/tools/ToolNode.ts
+const TOOL_NODE_RUN_NAME = "tool_batch";
+/**
+* Helper to check if a value is a Send object
+*/
+function isSend(value) {
+	return value instanceof _langchain_langgraph.Send;
+}
+function isHandoffToolName(name) {
+	return name.startsWith("lc_transfer_to_");
+}
+/**
+* Format a fail-closed diagnostic for malformed approval-decision
+* fields. Hosts deserialize resume payloads from untyped JSON, so
+* `responseText` and `updatedInput` can land here as anything; the
+* blocking ToolMessage carries this string so the host can debug the
+* exact wire shape that was rejected.
+*/
+function describeOfferedShape(value) {
+	if (value === void 0) return "<missing>";
+	if (value === null) return "null";
+	if (Array.isArray(value)) return "array";
+	return typeof value;
+}
+/**
+* Build the `tool_approval` interrupt payload from the set of pending
+* `ask`-decision entries collected during PreToolUse hook handling.
+* Pure function — doesn't touch ToolNode state — so it lives at module
+* scope. The interrupt itself is raised by the caller (which still
+* needs `interrupt()` plus the AsyncLocalStorage anchoring shim).
+*/
+function buildToolApprovalInterruptPayload(askEntries) {
+	return {
+		type: "tool_approval",
+		action_requests: askEntries.map(({ entry, reason }) => {
+			const request = {
+				tool_call_id: entry.call.id,
+				name: entry.call.name,
+				arguments: entry.args
+			};
+			if (reason != null) request.description = reason;
+			return request;
+		}),
+		review_configs: askEntries.map(({ entry, allowedDecisions }) => ({
+			action_name: entry.call.name,
+			tool_call_id: entry.call.id,
+			allowed_decisions: allowedDecisions ?? [
+				"approve",
+				"reject",
+				"edit",
+				"respond"
+			]
+		}))
+	};
+}
+/**
+* Build a `tool_call_id → ToolApprovalDecision` map from the host's
+* resume value. Hosts may return decisions either as an array (one per
+* action_request, in order) or as a record keyed by `tool_call_id`. Any
+* unrecognized shape (or a decision missing for a given call id) is
+* treated as "no decision" by callers — typically rejected so the run
+* doesn't silently invoke a tool the human never approved.
+*/
+function normalizeApprovalDecisions(callIds, resumeValue) {
+	const map = /* @__PURE__ */ new Map();
+	if (resumeValue == null) return map;
+	if (Array.isArray(resumeValue)) {
+		const limit = Math.min(callIds.length, resumeValue.length);
+		for (let i = 0; i < limit; i++) map.set(callIds[i], resumeValue[i]);
+		return map;
+	}
+	if (typeof resumeValue === "object") for (const callId of callIds) {
+		const decision = resumeValue[callId];
+		if (decision !== void 0) map.set(callId, decision);
+	}
+	return map;
+}
+/**
+* Merges code execution session context into the sessions map.
+*
+* The codeapi worker reports two distinct ids on a code-execution result:
+*  - `artifact.session_id` (the `sessionId` arg here) is the EXEC session
+*    — the sandbox VM that ran the code. It's transient and torn down
+*    post-execution; subsequent calls cannot reuse it as a sandbox.
+*  - `file.storage_session_id` on each `artifact.files[i]` is the STORAGE
+*    session — the file-server bucket prefix where the artifact actually
+*    lives and is served from.
+*
+* Per-file `storage_session_id` is preserved (not overwritten with the
+* exec id) because `_injected_files` are looked up against the
+* file-server's storage path on subsequent tool calls. Stomping the
+* storage id with the exec id silently 404s every follow-up tool call
+* within the same run — `cat /mnt/data/foo.txt` reports "No such file
+* or directory" because the worker can't mount a file at a path the
+* storage doesn't know about. Fall back to the exec id only when the
+* per-file id is absent (e.g. inline `content` files have no persistent
+* storage location).
+*/
+/**
+* Builds a `CodeEnvFile` ref from an arbitrary `FileRef`-like input,
+* narrowing onto the discriminated union: `kind: 'skill'` requires
+* `version`, other kinds forbid it.
+*
+* Defaults `kind` to `'user'` when unset — most ad-hoc files are
+* user-private; shared resources (skills/agents) populate their kind
+* upstream. A skill ref missing `version` falls back to `'user'` so
+* the upstream contract bug surfaces as a degraded sessionKey rather
+* than a runtime crash; primeSkillFiles is the only writer, and it
+* always sets `version` — see LC packages/api/src/agents/skillFiles.ts.
+*
+* `resource_id` carries the entity-that-owns-this-file's-session
+* identity (skill `_id` etc.); falls back to `id` (the storage
+* file_id) for inputs that haven't been updated to send the field
+* explicitly. The fallback degrades sessionKey resolution on the
+* codeapi side for shared kinds (it'll match the storage nanoid
+* against a skill _id and 403) — but won't crash, so an unmigrated
+* client still produces a diagnosable error instead of a stack
+* trace.
+*/
+function toInjectedFileRef(file, execSessionId) {
+	const base = {
+		id: file.id,
+		resource_id: file.resource_id ?? file.id,
+		name: file.name,
+		storage_session_id: file.storage_session_id ?? execSessionId
+	};
+	const kind = file.kind ?? "user";
+	if (kind === "skill" && file.version != null) return {
+		...base,
+		kind: "skill",
+		version: file.version
+	};
+	if (kind === "agent") return {
+		...base,
+		kind: "agent"
+	};
+	return {
+		...base,
+		kind: "user"
+	};
+}
+function fileIdentityKey(file) {
+	return `${file.storage_session_id ?? ""}\0${file.id}`;
+}
+function updateCodeSession(sessions, execSessionId, files) {
+	const newFiles = files ?? [];
+	const existingFiles = sessions.get("execute_code")?.files ?? [];
+	if (newFiles.length === 0) {
+		sessions.set("execute_code", {
+			session_id: execSessionId,
+			files: existingFiles,
+			lastUpdated: Date.now()
+		});
+		return;
+	}
+	const filesWithSession = [];
+	const newFileNames = /* @__PURE__ */ new Set();
+	const incomingByIdentity = /* @__PURE__ */ new Map();
+	for (const file of newFiles) {
+		const withSession = {
+			...file,
+			storage_session_id: file.storage_session_id ?? execSessionId
+		};
+		incomingByIdentity.set(fileIdentityKey(withSession), filesWithSession.length);
+		newFileNames.add(withSession.name);
+		filesWithSession.push(withSession);
+	}
+	const filteredExisting = [];
+	for (const e of existingFiles) {
+		const idx = incomingByIdentity.get(fileIdentityKey(e));
+		if (idx !== void 0) filesWithSession[idx] = {
+			...e,
+			...filesWithSession[idx]
+		};
+		if (!newFileNames.has(e.name)) filteredExisting.push(e);
+	}
+	sessions.set("execute_code", {
+		session_id: execSessionId,
+		files: [...filteredExisting, ...filesWithSession],
+		lastUpdated: Date.now()
+	});
+}
+var ToolNode = class extends require_run.RunnableCallable {
+	toolMap;
+	loadRuntimeTools;
+	handleToolErrors = true;
+	trace = false;
+	runLangfuse;
+	agentLangfuse;
+	toolCallStepIds;
+	errorHandler;
+	toolUsageCount;
+	/** Maps toolCallId → turn captured in runTool, used by handleRunToolCompletions */
+	toolCallTurns = /* @__PURE__ */ new Map();
+	/**
+	* `call.id → turn` map dedicated to the direct-path lifecycle so the
+	* turn assigned on first entry is REUSED on LangGraph resume.
+	* Distinct from `toolCallTurns` (which is cleared at the start of
+	* every `run()` to keep per-batch event-dispatch metadata fresh) —
+	* the direct path needs stability across re-entries triggered by
+	* `interrupt()` resumes (Codex P2 #30). Cleared with the rest of
+	* the per-Run state in `clearHeavyState`-equivalent flushes when
+	* the Run ends.
+	*/
+	directPathTurns = /* @__PURE__ */ new Map();
+	/** Tool registry for filtering (lazy computation of programmatic maps) */
+	toolRegistry;
+	/** Cached programmatic tools (computed once on first PTC call) */
+	programmaticCache;
+	/** Reference to Graph's sessions map for automatic session injection */
+	sessions;
+	/** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
+	eventDrivenMode = false;
+	/** Opt-in stream-layer prestart config for event-driven tools. */
+	eagerEventToolExecution;
+	/** Shared per-run prestarted tool registry populated by ChatModelStreamHandler. */
+	eagerEventToolExecutions;
+	/** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
+	eagerEventToolUsageCount;
+	/** Agent ID for event-driven mode */
+	agentId;
+	/**
+	* ID of the agent that owns this tool node, whenever the graph knows it
+	* (including top-level agents in a multi-agent graph). Surfaced to hooks as
+	* `executingAgentId` so they can attribute a tool batch to a specific agent
+	* even where `agentId` (the subagent-scope marker) is undefined.
+	*/
+	executingAgentId;
+	/** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
+	directToolNames;
+	/**
+	* File checkpointer extracted from the local coding tool bundle when
+	* `toolExecution.local.fileCheckpointing === true`. Exposed via
+	* {@link getFileCheckpointer}. Undefined when checkpointing is off
+	* or the local coding suite isn't bound to this node.
+	*/
+	fileCheckpointer;
+	/** Maximum characters allowed in a single tool result before truncation. */
+	maxToolResultChars;
+	/** Hook registry for PreToolUse/PostToolUse lifecycle hooks */
+	hookRegistry;
+	/**
+	* Run-scoped HITL config. When `enabled`, `ask` decisions from
+	* PreToolUse hooks raise a LangGraph `interrupt()` instead of being
+	* treated as fail-closed denies.
+	*/
+	humanInTheLoop;
+	/**
+	* Registry of tool outputs keyed by `tool<idx>turn<turn>`.
+	*
+	* Populated only when `toolOutputReferences.enabled` is true. The
+	* registry owns the run-scoped state (turn counter, last-seen runId,
+	* warn-once memo, stored outputs), so sharing a single instance
+	* across multiple ToolNodes in a run lets cross-agent `{{…}}`
+	* references resolve — which is why multi-agent graphs pass the
+	* *same* instance to every ToolNode they compile rather than each
+	* ToolNode building its own.
+	*/
+	toolOutputRegistry;
+	/** Run-scoped selection for swapping remote code tools to local executors. */
+	toolExecution;
+	/**
+	* Monotonic counter used to mint a unique scope id for anonymous
+	* batches (ones invoked without a `run_id` in
+	* `config.configurable`). Each such batch gets its own registry
+	* partition so concurrent anonymous invocations can't delete each
+	* other's in-flight state.
+	*/
+	anonBatchCounter = 0;
+	constructor({ tools, toolMap, name, tags, trace, runLangfuse, agentLangfuse, errorHandler, toolCallStepIds, handleToolErrors, loadRuntimeTools, toolRegistry, sessions, eventDrivenMode, eagerEventToolExecution, eagerEventToolExecutions, eagerEventToolUsageCount, agentId, executingAgentId, directToolNames, maxContextTokens, maxToolResultChars, hookRegistry, humanInTheLoop, toolOutputReferences, toolOutputRegistry, toolExecution, fileCheckpointer }) {
+		super({
+			name: name ?? TOOL_NODE_RUN_NAME,
+			tags,
+			func: (input, config) => this.run(input, config)
+		});
+		this.trace = trace ?? this.trace;
+		this.runLangfuse = runLangfuse;
+		this.agentLangfuse = agentLangfuse;
+		this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
+		this.toolCallStepIds = toolCallStepIds;
+		this.handleToolErrors = handleToolErrors ?? this.handleToolErrors;
+		this.loadRuntimeTools = loadRuntimeTools;
+		this.errorHandler = errorHandler;
+		this.toolUsageCount = /* @__PURE__ */ new Map();
+		this.toolRegistry = require_resolveLocalExecutionTools.resolveLocalToolRegistry({
+			toolRegistry,
+			toolExecution
+		});
+		this.sessions = sessions;
+		this.eventDrivenMode = eventDrivenMode ?? false;
+		this.eagerEventToolExecution = eagerEventToolExecution;
+		this.eagerEventToolExecutions = eagerEventToolExecutions;
+		this.eagerEventToolUsageCount = eagerEventToolUsageCount;
+		this.agentId = agentId;
+		this.executingAgentId = executingAgentId ?? agentId;
+		this.directToolNames = directToolNames;
+		this.maxToolResultChars = maxToolResultChars ?? require_truncation.calculateMaxToolResultChars(maxContextTokens);
+		this.hookRegistry = hookRegistry;
+		this.humanInTheLoop = humanInTheLoop;
+		this.toolExecution = toolExecution;
+		this.fileCheckpointer = fileCheckpointer;
+		this.applyToolExecutionOverrides();
+		/**
+		* Precedence: an explicitly passed `toolOutputRegistry` instance
+		* wins over a config object so a host (`Graph`) can share one
+		* registry across many ToolNodes. When only the config is
+		* provided (direct ToolNode usage), build a local registry so
+		* the feature still works without graph-level plumbing. Registry
+		* caps are intentionally decoupled from `maxToolResultChars`:
+		* the registry stores the raw untruncated output so a later
+		* `{{…}}` substitution pipes the full payload into the next
+		* tool, even when the LLM saw a truncated preview.
+		*/
+		if (toolOutputRegistry != null) this.toolOutputRegistry = toolOutputRegistry;
+		else if (toolOutputReferences?.enabled === true) this.toolOutputRegistry = new require_toolOutputReferences.ToolOutputReferenceRegistry({
+			maxOutputSize: toolOutputReferences.maxOutputSize,
+			maxTotalSize: toolOutputReferences.maxTotalSize
+		});
+	}
+	async invoke(input, options) {
+		return require_langfuseRuntimeScope.withLangfuseRuntimeScope(require_langfuseRuntimeScope.resolveLangfuseRuntimeScope({
+			runLangfuse: this.runLangfuse,
+			langfuseOverlay: this.agentLangfuse
+		}), () => super.invoke(input, options));
+	}
+	/**
+	* Returns the run-scoped tool output registry, or `undefined` when
+	* the feature is disabled.
+	*
+	* @internal Exposed for test observation only. Host code should rely
+	* on `{{tool<i>turn<n>}}` substitution at tool-invocation time and
+	* not mutate the registry directly.
+	*/
+	_unsafeGetToolOutputRegistry() {
+		return this.toolOutputRegistry;
+	}
+	/**
+	* Replaces known remote Code API tools with local-process tools when
+	* `RunConfig.toolExecution.engine === 'local'`. In event-driven mode those
+	* names are also marked direct so the SDK executes them locally instead of
+	* dispatching the batch to a host-side remote sandbox handler. When the
+	* local coding suite is enabled, this also injects file/search/edit tools.
+	*/
+	applyToolExecutionOverrides() {
+		const resolved = require_resolveLocalExecutionTools.resolveLocalExecutionTools({
+			toolMap: this.toolMap,
+			toolExecution: this.toolExecution,
+			fileCheckpointer: this.fileCheckpointer
+		});
+		this.toolMap = resolved.toolMap;
+		if (resolved.fileCheckpointer != null) this.fileCheckpointer = resolved.fileCheckpointer;
+		if (resolved.directToolNames.size === 0) return;
+		this.directToolNames = new Set([...this.directToolNames ?? /* @__PURE__ */ new Set(), ...resolved.directToolNames]);
+		this.programmaticCache = void 0;
+	}
+	/**
+	* Returns the per-Run file checkpointer when
+	* `toolExecution.local.fileCheckpointing === true`. Hosts call
+	* `rewind()` on the returned object to restore captured pre-write
+	* file contents — the standard "undo a tool batch" pattern. Returns
+	* undefined when checkpointing is disabled or the local coding suite
+	* isn't bound. Manual review (finding E): without this getter, the
+	* config flag was a silent no-op outside of direct
+	* `createLocalCodingToolBundle()` use.
+	*/
+	getFileCheckpointer() {
+		return this.fileCheckpointer;
+	}
+	*getRegisteredHandoffNames() {
+		if (this.directToolNames != null) for (const toolName of this.directToolNames) yield toolName;
+		for (const toolName of this.toolMap.keys()) {
+			if (this.directToolNames?.has(toolName) === true) continue;
+			yield toolName;
+		}
+	}
+	hasRegisteredHandoffTool() {
+		for (const toolName of this.getRegisteredHandoffNames()) if (isHandoffToolName(toolName)) return true;
+		return false;
+	}
+	getHandoffToolNameSuggestion(callName) {
+		if (!isHandoffToolName(callName)) return;
+		let suggestion;
+		for (const toolName of this.getRegisteredHandoffNames()) {
+			if (!isHandoffToolName(toolName) || toolName.length >= callName.length || !callName.startsWith(toolName)) continue;
+			if (suggestion == null || toolName.length > suggestion.length) suggestion = toolName;
+		}
+		return suggestion;
+	}
+	shouldHandleUnknownHandoffLocally(callName, hasRegisteredHandoffTool) {
+		if (!isHandoffToolName(callName) || this.toolMap.has(callName)) return false;
+		return hasRegisteredHandoffTool ?? this.hasRegisteredHandoffTool();
+	}
+	getUnknownToolErrorMessage(callName) {
+		const suggestion = this.getHandoffToolNameSuggestion(callName);
+		if (suggestion == null) return `Tool "${callName}" not found.`;
+		return `Tool "${callName}" not found. Did you mean "${suggestion}"? Handoff tool names must match exactly.`;
+	}
+	/**
+	* Flush the per-Run direct-path turn cache. Called by the Graph at
+	* end-of-Run via `clearHeavyState`. The map intentionally survives
+	* `run()` re-entry so an interrupt + resume reuses the original
+	* slot (Codex P2 #30), but it would otherwise grow linearly with
+	* tool calls and could collide across Runs if a provider reused
+	* call IDs (Codex P2 #33). Hosts can also call this directly if
+	* they reuse a ToolNode across batches outside of a Graph.
+	*/
+	clearDirectPathTurns() {
+		this.directPathTurns.clear();
+	}
+	/**
+	* Returns cached programmatic tools, computing once on first access.
+	* Single iteration builds both toolMap and toolDefs simultaneously.
+	*/
+	getProgrammaticTools() {
+		if (this.programmaticCache) return this.programmaticCache;
+		const toolMap = /* @__PURE__ */ new Map();
+		const toolDefs = [];
+		if (this.toolRegistry) {
+			for (const [name, toolDef] of this.toolRegistry) if ((toolDef.allowed_callers ?? ["direct"]).includes("code_execution")) {
+				toolDefs.push(toolDef);
+				const tool = this.toolMap.get(name);
+				if (tool) toolMap.set(name, tool);
+			}
+		}
+		this.programmaticCache = {
+			toolMap,
+			toolDefs
+		};
+		return this.programmaticCache;
+	}
+	/**
+	* Returns a snapshot of the current tool usage counts.
+	* @returns A ReadonlyMap where keys are tool names and values are their usage counts.
+	*/
+	getToolUsageCounts() {
+		return new Map(this.toolUsageCount);
+	}
+	recordToolUsageTurn(toolName, turn, callId) {
+		this.toolUsageCount.set(toolName, Math.max(this.toolUsageCount.get(toolName) ?? 0, turn + 1));
+		if (callId != null && callId !== "") this.toolCallTurns.set(callId, turn);
+	}
+	recordEventToolPlanningTurn(toolName, turn, callId) {
+		this.recordToolUsageTurn(toolName, turn, callId);
+		if (this.canConsumeEagerEventExecution()) this.eagerEventToolUsageCount?.set(toolName, Math.max(this.eagerEventToolUsageCount.get(toolName) ?? 0, turn + 1));
+	}
+	/**
+	* Runs a single tool call with error handling.
+	*
+	* `batchIndex` is the tool's position within the current ToolNode
+	* batch and, together with `this.currentTurn`, forms the key used to
+	* register the output for future `{{tool<idx>turn<turn>}}`
+	* substitutions. Omit when no registration should occur.
+	*/
+	async runTool(call, config, batchContext = {}) {
+		const { batchIndex, turn, batchScopeId, resolvedArgsByCallId, preBatchSnapshot } = batchContext;
+		const tool = this.toolMap.get(call.name);
+		const registry = this.toolOutputRegistry;
+		let resolveFn;
+		if (preBatchSnapshot != null) resolveFn = (_runId, args) => preBatchSnapshot.resolve(args);
+		else if (registry != null) resolveFn = (runIdArg, args) => registry.resolve(runIdArg, args);
+		/**
+		* Precompute the reference key once per call — captured locally
+		* so concurrent `invoke()` calls on the same ToolNode cannot race
+		* on a shared turn field.
+		*/
+		const refKey = registry != null && batchIndex != null && turn != null ? require_toolOutputReferences.buildReferenceKey(batchIndex, turn) : void 0;
+		/**
+		* Hoisted outside the try so the catch branch can append
+		* `[unresolved refs: …]` to error messages — otherwise the LLM
+		* only sees a generic error when it references a bad key, losing
+		* the self-correction signal this feature is meant to provide.
+		*/
+		let unresolvedRefs = [];
+		/**
+		* Use the caller-provided `batchScopeId` when threaded from
+		* `run()` (so anonymous batches get their own unique scope).
+		* Fall back to the config's `run_id` when runTool is invoked
+		* from a context that doesn't thread it — that still preserves
+		* the runId-based partitioning for named runs.
+		*/
+		const runId = batchScopeId ?? config.configurable?.run_id;
+		try {
+			if (tool === void 0) throw new Error(this.getUnknownToolErrorMessage(call.name));
+			/**
+			* `usageCount` is the per-tool-name invocation index that
+			* web-search and other tools observe via `invokeParams.turn`.
+			* It is intentionally distinct from the outer `turn` parameter
+			* (the batch turn used for ref keys); the latter is captured
+			* before the try block when constructing `refKey`.
+			*
+			* Prefer the value `runDirectToolWithLifecycleHooks` already
+			* incremented (Codex P2 #27) — its hook wants the SAME turn
+			* the tool will execute under. When called from a path that
+			* doesn't pre-increment (event dispatch, the no-hooks
+			* shortcut), do the read+increment here.
+			*/
+			const usageCount = batchContext.usageCount ?? (() => {
+				const next = this.toolUsageCount.get(call.name) ?? 0;
+				this.toolUsageCount.set(call.name, next + 1);
+				if (call.id != null && call.id !== "") this.toolCallTurns.set(call.id, next);
+				return next;
+			})();
+			if (call.name === "web_search" && usageCount >= 3) {
+				return this.blockDirectCall({
+					call,
+					resolvedArgs: call.args,
+					reason: "Search limit reached (3 searches per response). Do not search again. Write your final answer now using the material you already retrieved, and state explicitly what you could not confirm.",
+					hookRegistry: this.hookRegistry,
+					runId,
+					threadId
+				});
+			}
+			let args = call.args;
+			if (resolveFn != null) {
+				const { resolved, unresolved } = resolveFn(runId, args);
+				args = resolved;
+				unresolvedRefs = unresolved;
+				/**
+				* Expose the post-substitution args to downstream completion
+				* events so audit logs / host-side `ON_RUN_STEP_COMPLETED`
+				* handlers observe what actually ran, not the `{{…}}`
+				* template. Only string/object args are worth recording.
+				*/
+				if (resolvedArgsByCallId != null && call.id != null && call.id !== "" && resolved !== call.args && typeof resolved === "object") resolvedArgsByCallId.set(call.id, resolved);
+			}
+			const stepId = this.toolCallStepIds?.get(call.id);
+			let invokeParams = {
+				...call,
+				args,
+				type: "tool_call",
+				stepId,
+				turn: usageCount
+			};
+			if (call.name === "run_tools_with_code" || call.name === "run_tools_with_bash") {
+				const { toolMap, toolDefs } = this.getProgrammaticTools();
+				invokeParams = {
+					...invokeParams,
+					toolMap,
+					toolDefs,
+					hookContext: {
+						registry: this.hookRegistry,
+						runId: config.configurable?.run_id ?? "",
+						threadId: config.configurable?.thread_id,
+						agentId: this.agentId,
+						executingAgentId: this.executingAgentId
+					}
+				};
+			} else if (call.name === "tool_search") invokeParams = {
+				...invokeParams,
+				toolRegistry: this.toolRegistry
+			};
+			/**
+			* Inject session context for code execution tools when available.
+			* Each file uses its own session_id (supporting multi-session file tracking).
+			* Both session_id and _injected_files are injected directly to invokeParams
+			* (not inside args) so they bypass Zod schema validation and reach config.toolCall.
+			*
+			* session_id is always injected when available, but concrete file refs
+			* still need to travel through `_injected_files`; the legacy
+			* `/files/<session_id>` fallback was removed from the executors.
+			*/
+			if (require_enum.CODE_EXECUTION_TOOLS.has(call.name)) {
+				const codeSession = this.sessions?.get("execute_code");
+				const execSessionId = codeSession?.session_id;
+				if (execSessionId != null && execSessionId !== "") {
+					invokeParams = {
+						...invokeParams,
+						session_id: execSessionId
+					};
+					if (codeSession?.files != null && codeSession.files.length > 0) invokeParams._injected_files = codeSession.files.map((file) => toInjectedFileRef(file, execSessionId));
+				}
+			}
+			const output = await tool.invoke(invokeParams, config);
+			if ((0, _langchain_langgraph.isCommand)(output)) return output;
+			if ((0, _langchain_core_messages.isBaseMessage)(output) && output._getType() === "tool") {
+				const toolMsg = output;
+				if (toolMsg.status === "error") {
+					/**
+					* Error ToolMessages bypass registration but still stamp the
+					* unresolved-refs hint into `additional_kwargs` so the lazy
+					* annotation transform surfaces it to the LLM, letting the
+					* model self-correct when its reference key caused the
+					* failure. Persisted `content` stays clean.
+					*/
+					if (unresolvedRefs.length > 0) toolMsg.additional_kwargs = {
+						...toolMsg.additional_kwargs,
+						_unresolvedRefs: unresolvedRefs
+					};
+					return toolMsg;
+				}
+				if (this.toolOutputRegistry != null || unresolvedRefs.length > 0) if (typeof toolMsg.content === "string") {
+					const rawContent = toolMsg.content;
+					const registryContent = require_CodeSessionFileSummary.stripCodeSessionFileSummary(rawContent);
+					toolMsg.content = require_truncation.truncateToolResultContent(rawContent, this.maxToolResultChars);
+					const refMeta = this.recordOutputReference(runId, registryContent, refKey, unresolvedRefs);
+					if (refMeta != null) toolMsg.additional_kwargs = {
+						...toolMsg.additional_kwargs,
+						...refMeta
+					};
+				} else {
+					/**
+					* Non-string content (multi-part content blocks — text +
+					* image). Known limitation: we cannot register under a
+					* reference key because there's no canonical serialized
+					* form. Warn once per tool per run when the caller
+					* intended to register. The unresolved-refs hint is still
+					* stamped as metadata; the lazy transform prepends a text
+					* block at request time so the LLM gets the self-correction
+					* signal.
+					*/
+					if (unresolvedRefs.length > 0) toolMsg.additional_kwargs = {
+						...toolMsg.additional_kwargs,
+						_unresolvedRefs: unresolvedRefs
+					};
+					if (refKey != null && this.toolOutputRegistry.claimWarnOnce(runId, call.name)) console.warn(`[ToolNode] Skipping tool output reference for "${call.name}": ToolMessage content is not a string (further occurrences for this tool in the same run are suppressed).`);
+				}
+				return toolMsg;
+			}
+			const rawContent = typeof output === "string" ? output : JSON.stringify(output);
+			const truncated = require_truncation.truncateToolResultContent(rawContent, this.maxToolResultChars);
+			const refMeta = this.recordOutputReference(runId, require_CodeSessionFileSummary.stripCodeSessionFileSummary(rawContent), refKey, unresolvedRefs);
+			return new _langchain_core_messages.ToolMessage({
+				status: "success",
+				name: tool.name,
+				content: truncated,
+				tool_call_id: call.id,
+				...refMeta != null && { additional_kwargs: refMeta }
+			});
+		} catch (_e) {
+			const e = _e;
+			if (!this.handleToolErrors) throw e;
+			if ((0, _langchain_langgraph.isGraphInterrupt)(e)) throw e;
+			if (this.errorHandler) try {
+				await this.errorHandler({
+					error: e,
+					id: call.id,
+					name: call.name,
+					input: call.args
+				}, config.metadata);
+			} catch (handlerError) {
+				console.error("Error in errorHandler:", {
+					toolName: call.name,
+					toolCallId: call.id,
+					toolArgs: call.args,
+					stepId: this.toolCallStepIds?.get(call.id),
+					turn: this.toolUsageCount.get(call.name),
+					originalError: {
+						message: e.message,
+						stack: e.stack ?? void 0
+					},
+					handlerError: handlerError instanceof Error ? {
+						message: handlerError.message,
+						stack: handlerError.stack ?? void 0
+					} : {
+						message: String(handlerError),
+						stack: void 0
+					}
+				});
+			}
+			const errorContent = `Error: ${e.message}\n Please fix your mistakes.`;
+			const refMeta = unresolvedRefs.length > 0 ? this.recordOutputReference(runId, errorContent, void 0, unresolvedRefs) : void 0;
+			return new _langchain_core_messages.ToolMessage({
+				status: "error",
+				content: errorContent,
+				name: call.name,
+				tool_call_id: call.id ?? "",
+				...refMeta != null && { additional_kwargs: refMeta }
+			});
+		}
+	}
+	/**
+	* Runs a single in-process tool call with the same lifecycle hooks
+	* the event-dispatch path fires (`PreToolUse`, `PermissionDenied`,
+	* `PostToolUse`, `PostToolUseFailure`). Used for any tool whose
+	* implementation lives in the SDK process — i.e. every entry in
+	* `directToolNames` — so host-supplied policy hooks gate
+	* direct-invoked tools the same way they gate dispatched ones.
+	*
+	* Fast path: when the registry has none of the relevant events
+	* registered for this run, falls through to `runTool` with zero
+	* extra work. The hook list is also checked via
+	* `hasHookFor(event, runId)`, which performs the registry's own
+	* O(1) shortcut.
+	*
+	* Hook semantics intentionally mirror `dispatchToolEvents` for the
+	* single-call case:
+	*   - `PreToolUse` returning `decision: 'deny'` synthesizes an error
+	*     `ToolMessage` and fires `PermissionDenied` (observational).
+	*   - `PreToolUse` returning `decision: 'ask'`:
+	*     • When `humanInTheLoop.enabled === true`: raises a real
+	*       `tool_approval` interrupt for this single tool call (the
+	*       same payload shape the event path produces). On resume:
+	*       `approve` runs the tool, `reject` blocks via
+	*       `blockDirectCall`, `respond` returns the host-supplied
+	*       `responseText` as a synthetic success ToolMessage,
+	*       `edit` re-runs with edited args. LangGraph re-enters
+	*       ToolNode.run from the start on resume; the hook fires
+	*       again and the resume value distinguishes "first ask" from
+	*       "second pass with decision".
+	*     • When HITL is off: collapses to a fail-closed deny (matches
+	*       the rest of the SDK's HITL-disabled default). One-time
+	*       warning logged so hosts notice the gap.
+	*   - `PreToolUse.updatedInput` is applied to the call before
+	*     `runTool` runs; placeholder resolution inside `runTool` is
+	*     idempotent on already-resolved args.
+	*   - `PostToolUse.updatedOutput` replaces the returned
+	*     `ToolMessage` content (preserving id/name/status).
+	*   - `PostToolUseFailure` fires when `runTool` returns a
+	*     `ToolMessage` whose `status === 'error'`. Observational only;
+	*     the error message stays the source of truth.
+	*
+	* `PostToolBatch` aggregation across direct + dispatched outcomes is
+	* a separate concern: `dispatchToolEvents` accumulates batch entries
+	* locally and fires `PostToolBatch` at the end of its scope. Wiring
+	* direct-call entries into that aggregation crosses the two paths'
+	* scopes and is left to a follow-up.
+	*/
+	async runDirectToolWithLifecycleHooks(call, config, batchContext = {}) {
+		const runId = config.configurable?.run_id ?? "";
+		const hookRegistry = this.hookRegistry;
+		const hasPreHook = hookRegistry?.hasHookFor("PreToolUse", runId) === true;
+		const hasPostHook = hookRegistry?.hasHookFor("PostToolUse", runId) === true;
+		const hasFailureHook = hookRegistry?.hasHookFor("PostToolUseFailure", runId) === true;
+		if (hookRegistry == null || !hasPreHook && !hasPostHook && !hasFailureHook) return this.runTool(call, config, batchContext);
+		const threadId = config.configurable?.thread_id;
+		const registryRunId = batchContext.batchScopeId ?? config.configurable?.run_id;
+		let usageCount;
+		const cachedTurn = call.id != null && call.id !== "" ? this.directPathTurns.get(call.id) ?? this.toolCallTurns.get(call.id) : void 0;
+		if (cachedTurn != null) usageCount = cachedTurn;
+		else {
+			usageCount = this.toolUsageCount.get(call.name) ?? 0;
+			this.toolUsageCount.set(call.name, usageCount + 1);
+			if (call.id != null && call.id !== "") {
+				this.toolCallTurns.set(call.id, usageCount);
+				this.directPathTurns.set(call.id, usageCount);
+			}
+		}
+		const turn = usageCount;
+		const stepId = this.toolCallStepIds?.get(call.id ?? "") ?? "";
+		let resolvedArgs = call.args;
+		if (batchContext.preBatchSnapshot != null) {
+			const { resolved } = batchContext.preBatchSnapshot.resolve(call.args);
+			resolvedArgs = resolved;
+		} else if (this.toolOutputRegistry != null) {
+			const { resolved } = this.toolOutputRegistry.resolve(registryRunId, call.args);
+			resolvedArgs = resolved;
+		}
+		let effectiveCall = call;
+		if (hasPreHook) {
+			const preResult = await require_executeHooks.executeHooks({
+				registry: hookRegistry,
+				input: {
+					hook_event_name: "PreToolUse",
+					runId,
+					threadId,
+					agentId: this.agentId,
+					executingAgentId: this.executingAgentId,
+					toolName: call.name,
+					toolInput: resolvedArgs,
+					toolUseId: call.id ?? "",
+					stepId,
+					turn
+				},
+				sessionId: runId,
+				matchQuery: call.name
+			}).catch(() => void 0);
+			if (preResult != null) {
+				if (batchContext.additionalContextsSink != null && preResult.additionalContexts.length > 0) batchContext.additionalContextsSink.push(...preResult.additionalContexts);
+				if (preResult.updatedInput != null) effectiveCall = {
+					...call,
+					args: preResult.updatedInput
+				};
+				if (preResult.decision === "deny") return this.blockDirectCall({
+					call,
+					resolvedArgs,
+					reason: preResult.reason ?? "Blocked by hook",
+					hookRegistry,
+					runId,
+					threadId
+				});
+				if (preResult.decision === "ask") {
+					if (this.humanInTheLoop?.enabled !== true) {
+						const reason = this.resolveAskDecisionForDirectTool(preResult.reason, call.name);
+						return this.blockDirectCall({
+							call,
+							resolvedArgs,
+							reason,
+							hookRegistry,
+							runId,
+							threadId
+						});
+					}
+					const payload = buildToolApprovalInterruptPayload([{
+						entry: {
+							call: effectiveCall,
+							args: effectiveCall.args,
+							stepId
+						},
+						reason: preResult.reason,
+						allowedDecisions: preResult.allowedDecisions
+					}]);
+					const resumeValue = _langchain_core_singletons.AsyncLocalStorageProviderSingleton.runWithConfig(config, () => (0, _langchain_langgraph.interrupt)(payload));
+					const decision = normalizeApprovalDecisions([call.id], resumeValue).get(call.id) ?? {
+						type: "reject",
+						reason: "No decision provided for tool approval"
+					};
+					const declaredType = decision.type;
+					if (preResult.allowedDecisions != null && (typeof declaredType !== "string" || !preResult.allowedDecisions.includes(declaredType))) return this.blockDirectCall({
+						call,
+						resolvedArgs,
+						reason: `Decision "${typeof declaredType === "string" ? declaredType : "<missing>"}" not in allowedDecisions [${preResult.allowedDecisions.join(", ")}] — failing closed`,
+						hookRegistry,
+						runId,
+						threadId
+					});
+					if (decision.type === "reject") return this.blockDirectCall({
+						call,
+						resolvedArgs,
+						reason: decision.reason ?? preResult.reason ?? "Rejected by user",
+						hookRegistry,
+						runId,
+						threadId
+					});
+					if (decision.type === "respond") {
+						const responseText = decision.responseText;
+						if (typeof responseText !== "string") return this.blockDirectCall({
+							call,
+							resolvedArgs,
+							reason: "Approval payload `respond` was missing a string `responseText`",
+							hookRegistry,
+							runId,
+							threadId
+						});
+						return new _langchain_core_messages.ToolMessage({
+							status: "success",
+							content: responseText,
+							name: call.name,
+							tool_call_id: call.id ?? ""
+						});
+					}
+					if (decision.type === "edit") {
+						const updatedInput = decision.updatedInput;
+						if (updatedInput === null || typeof updatedInput !== "object" || Array.isArray(updatedInput)) return new _langchain_core_messages.ToolMessage({
+							status: "error",
+							content: "Decision \"edit\" missing object updatedInput — failing closed.",
+							name: call.name,
+							tool_call_id: call.id ?? ""
+						});
+						effectiveCall = {
+							...call,
+							args: updatedInput
+						};
+					}
+				}
+			}
+		}
+		const output = await this.runTool(effectiveCall, config, {
+			...batchContext,
+			usageCount
+		});
+		if (!(output instanceof _langchain_core_messages.ToolMessage)) return output;
+		if (output.status === "error" && hasFailureHook) {
+			const failureResult = await require_executeHooks.executeHooks({
+				registry: hookRegistry,
+				input: {
+					hook_event_name: "PostToolUseFailure",
+					runId,
+					threadId,
+					agentId: this.agentId,
+					executingAgentId: this.executingAgentId,
+					toolName: call.name,
+					toolInput: effectiveCall.args,
+					toolUseId: call.id ?? "",
+					error: typeof output.content === "string" ? output.content : JSON.stringify(output.content),
+					stepId,
+					turn
+				},
+				sessionId: runId,
+				matchQuery: call.name
+			}).catch(() => void 0);
+			if (failureResult != null && batchContext.additionalContextsSink != null && failureResult.additionalContexts.length > 0) batchContext.additionalContextsSink.push(...failureResult.additionalContexts);
+			return output;
+		}
+		if (output.status !== "error" && hasPostHook) {
+			const postResult = await require_executeHooks.executeHooks({
+				registry: hookRegistry,
+				input: {
+					hook_event_name: "PostToolUse",
+					runId,
+					threadId,
+					agentId: this.agentId,
+					executingAgentId: this.executingAgentId,
+					toolName: call.name,
+					toolInput: effectiveCall.args,
+					toolOutput: output.content,
+					toolUseId: call.id ?? "",
+					stepId,
+					turn
+				},
+				sessionId: runId,
+				matchQuery: call.name
+			}).catch(() => void 0);
+			if (postResult != null && batchContext.additionalContextsSink != null && postResult.additionalContexts.length > 0) batchContext.additionalContextsSink.push(...postResult.additionalContexts);
+			if (postResult?.updatedOutput != null) {
+				const replaced = typeof postResult.updatedOutput === "string" ? postResult.updatedOutput : JSON.stringify(postResult.updatedOutput);
+				const refMeta = output.additional_kwargs;
+				const refKey = refMeta?._refKey;
+				const refScope = refMeta?._refScope;
+				if (this.toolOutputRegistry != null && refKey != null) this.toolOutputRegistry.set(refScope, refKey, replaced);
+				return new _langchain_core_messages.ToolMessage({
+					status: output.status,
+					name: output.name,
+					content: replaced,
+					artifact: output.artifact,
+					tool_call_id: output.tool_call_id,
+					additional_kwargs: output.additional_kwargs
+				});
+			}
+		}
+		return output;
+	}
+	/**
+	* `ask` decisions on direct-path tools collapse to fail-closed deny
+	* only when `humanInTheLoop.enabled !== true` (i.e. there's no host
+	* UI configured to actually prompt the user). Logged once per process
+	* so the gap is visible. When HITL IS enabled, `ask` raises a real
+	* LangGraph `interrupt()` instead — see `runDirectToolWithLifecycleHooks`.
+	*/
+	askDirectWarningEmitted = false;
+	resolveAskDecisionForDirectTool(reason, toolName) {
+		if (!this.askDirectWarningEmitted) {
+			this.askDirectWarningEmitted = true;
+			console.warn(`[ToolNode] PreToolUse returned 'ask' for direct-path tool "${toolName}" but humanInTheLoop is not enabled — failing closed. Set humanInTheLoop.enabled=true to raise a tool_approval interrupt the host can resolve.`);
+		}
+		return reason ?? "Blocked by hook";
+	}
+	/**
+	* Synthesize a Blocked ToolMessage AND fire `PermissionDenied`
+	* (observational) for a direct-path tool call. Centralised so the
+	* deny path looks identical whether the block came from `'deny'` or
+	* from a fail-closed/`'reject'`/policy-violation path.
+	*/
+	blockDirectCall(args) {
+		const { call, resolvedArgs, reason, hookRegistry, runId, threadId } = args;
+		if (hookRegistry.hasHookFor("PermissionDenied", runId) === true) require_executeHooks.executeHooks({
+			registry: hookRegistry,
+			input: {
+				hook_event_name: "PermissionDenied",
+				runId,
+				threadId,
+				agentId: this.agentId,
+				executingAgentId: this.executingAgentId,
+				toolName: call.name,
+				toolInput: resolvedArgs,
+				toolUseId: call.id ?? "",
+				reason
+			},
+			sessionId: runId,
+			matchQuery: call.name
+		}).catch(() => {});
+		return new _langchain_core_messages.ToolMessage({
+			status: "error",
+			content: `Blocked: ${reason}`,
+			name: call.name,
+			tool_call_id: call.id ?? ""
+		});
+	}
+	/**
+	* Registers the full, raw output under `refKey` (when provided) and
+	* builds the per-message ref metadata stamped onto the resulting
+	* `ToolMessage.additional_kwargs`. The metadata is read at LLM-
+	* request time by `annotateMessagesForLLM` to produce a transient
+	* annotated copy of the message — the persisted `content` itself
+	* stays clean.
+	*
+	* @param registryContent  The full, untruncated output to store in
+	*   the registry so `{{tool<i>turn<n>}}` substitutions deliver the
+	*   complete payload. Ignored when `refKey` is undefined.
+	* @param refKey  Precomputed `tool<i>turn<n>` key, or undefined when
+	*   the output is not to be registered (errors, disabled feature,
+	*   unavailable batch/turn).
+	* @param unresolved  Placeholder keys that did not resolve; surfaced
+	*   to the LLM lazily so it can self-correct.
+	* @returns A `ToolMessageRefMetadata` object when there is anything
+	*   to stamp, otherwise `undefined`.
+	*/
+	recordOutputReference(runId, registryContent, refKey, unresolved) {
+		if (this.toolOutputRegistry != null && refKey != null) this.toolOutputRegistry.set(runId, refKey, registryContent);
+		if (refKey == null && unresolved.length === 0) return void 0;
+		const meta = {};
+		if (refKey != null) {
+			meta._refKey = refKey;
+			/**
+			* Stamp the registry scope alongside the key so the lazy
+			* annotation transform can look up the right bucket. Anonymous
+			* invocations get a synthetic per-batch scope (`\0anon-<n>`)
+			* that `attemptInvoke` cannot derive from
+			* `config.configurable.run_id` — without this, anonymous-run
+			* refs would silently fail registry lookup and the LLM would
+			* never see `[ref: …]` markers for outputs that were registered.
+			*/
+			if (runId != null) meta._refScope = runId;
+		}
+		if (unresolved.length > 0) meta._unresolvedRefs = unresolved;
+		return meta;
+	}
+	/**
+	* Builds code session context for injection into event-driven tool calls.
+	* Mirrors the session injection logic in runTool() for direct execution.
+	*/
+	getCodeSessionContext() {
+		if (!this.sessions) return;
+		const codeSession = this.sessions.get("execute_code");
+		if (!codeSession) return;
+		const execSessionId = codeSession.session_id;
+		const context = { session_id: execSessionId };
+		if (codeSession.files && codeSession.files.length > 0) context.files = codeSession.files.map((file) => toInjectedFileRef(file, execSessionId));
+		return context;
+	}
+	/**
+	* Extracts code execution session context from tool results and stores in Graph.sessions.
+	* Mirrors the session storage logic in handleRunToolCompletions for direct execution.
+	*/
+	storeCodeSessionFromResults(results, requestMap) {
+		if (!this.sessions) return;
+		for (let i = 0; i < results.length; i++) {
+			const result = results[i];
+			if (result.status !== "success" || result.artifact == null) continue;
+			const request = requestMap.get(result.toolCallId);
+			if (request?.name == null || request.name === "" || !require_enum.CODE_EXECUTION_TOOLS.has(request.name) && request.name !== "skill") continue;
+			const artifact = result.artifact;
+			const execSessionId = artifact?.session_id;
+			if (execSessionId == null || execSessionId === "") continue;
+			updateCodeSession(this.sessions, execSessionId, artifact?.files);
+		}
+	}
+	/**
+	* Post-processes standard runTool outputs: dispatches ON_RUN_STEP_COMPLETED
+	* and stores code session context. Mirrors the completion handling in
+	* dispatchToolEvents for the event-driven path.
+	*
+	* By handling completions here in graph context (rather than in the
+	* stream consumer via ToolEndHandler), the race between the stream
+	* consumer and graph execution is eliminated.
+	*
+	* @param resolvedArgsByCallId  Per-batch resolved-args sink populated
+	*   by `runTool`. Threaded as a local map (instead of instance state)
+	*   so concurrent batches cannot read each other's entries.
+	*/
+	async handleRunToolCompletions(calls, outputs, config, resolvedArgsByCallId) {
+		for (let i = 0; i < calls.length; i++) {
+			const call = calls[i];
+			const output = outputs[i];
+			const turn = this.toolCallTurns.get(call.id) ?? 0;
+			if ((0, _langchain_langgraph.isCommand)(output)) continue;
+			const toolMessage = output;
+			const toolCallId = call.id ?? "";
+			if (toolMessage.status === "error" && this.errorHandler != null) continue;
+			if (this.sessions && require_enum.CODE_EXECUTION_TOOLS.has(call.name)) {
+				const artifact = toolMessage.artifact;
+				const execSessionId = artifact?.session_id;
+				if (execSessionId != null && execSessionId !== "") updateCodeSession(this.sessions, execSessionId, artifact?.files);
+			}
+			const stepId = this.toolCallStepIds?.get(toolCallId) ?? "";
+			if (!stepId) continue;
+			const contentString = typeof toolMessage.content === "string" ? toolMessage.content : JSON.stringify(toolMessage.content);
+			/**
+			* Prefer the post-substitution args when a `{{…}}` placeholder
+			* was resolved in `runTool`. This keeps
+			* `ON_RUN_STEP_COMPLETED.tool_call.args` consistent with what
+			* the tool actually received rather than leaking the template.
+			*/
+			const effectiveArgs = resolvedArgsByCallId?.get(toolCallId) ?? call.args;
+			const tool_call = {
+				args: typeof effectiveArgs === "string" ? effectiveArgs : JSON.stringify(effectiveArgs ?? {}),
+				name: call.name,
+				id: toolCallId,
+				output: contentString,
+				progress: 1
+			};
+			await require_events.safeDispatchCustomEvent("on_run_step_completed", { result: {
+				id: stepId,
+				index: turn,
+				type: "tool_call",
+				tool_call
+			} }, config);
+		}
+	}
+	/**
+	* Dispatches tool calls to the host via ON_TOOL_EXECUTE event and returns raw ToolMessages.
+	* Core logic for event-driven execution, separated from output shaping.
+	*
+	* Hook lifecycle (when `hookRegistry` is set):
+	* 1. **PreToolUse** fires per call in parallel before dispatch. Denied
+	*    calls produce error ToolMessages and fire **PermissionDenied**;
+	*    surviving calls proceed with optional `updatedInput`.
+	* 2. Surviving calls are dispatched to the host via `ON_TOOL_EXECUTE`.
+	* 3. **PostToolUse** / **PostToolUseFailure** fire per result. Post hooks
+	*    can replace tool output via `updatedOutput`.
+	* 4. Injected messages from results are collected and returned alongside
+	*    ToolMessages (appended AFTER to respect provider ordering).
+	*/
+	async dispatchToolEvents(toolCalls, config, batchContext = {}) {
+		const { batchIndices, turn, batchScopeId, preResolvedArgs, preBatchSnapshot } = batchContext;
+		const runId = config.configurable?.run_id ?? "";
+		/**
+		* Registry-facing scope id — prefers the caller-threaded
+		* `batchScopeId` so anonymous batches target their own unique
+		* bucket and don't step on concurrent anonymous invocations.
+		* Hooks and event payloads keep using the empty-string coerced
+		* `runId` for backward compat.
+		*/
+		const registryRunId = batchScopeId ?? config.configurable?.run_id;
+		const threadId = config.configurable?.thread_id;
+		const registry = this.toolOutputRegistry;
+		const unresolvedByCallId = /* @__PURE__ */ new Map();
+		const preToolCalls = toolCalls.map((call, i) => {
+			const originalArgs = call.args;
+			let resolvedArgs = originalArgs;
+			/**
+			* When the caller provided a pre-resolved map (the mixed
+			* direct+event path snapshots event args synchronously before
+			* awaiting directs so they can't accidentally resolve
+			* same-turn direct outputs), use those entries verbatim instead
+			* of re-resolving against a registry that may have changed
+			* since the batch started.
+			*/
+			const pre = call.id != null ? preResolvedArgs?.get(call.id) : void 0;
+			if (pre != null) {
+				resolvedArgs = pre.resolved;
+				if (pre.unresolved.length > 0 && call.id != null) unresolvedByCallId.set(call.id, pre.unresolved);
+			} else if (registry != null) {
+				const { resolved, unresolved } = registry.resolve(registryRunId, originalArgs);
+				resolvedArgs = resolved;
+				if (unresolved.length > 0 && call.id != null) unresolvedByCallId.set(call.id, unresolved);
+			}
+			return {
+				call,
+				stepId: this.toolCallStepIds?.get(call.id) ?? "",
+				args: resolvedArgs,
+				batchIndex: batchIndices?.[i]
+			};
+		});
+		const messageByCallId = /* @__PURE__ */ new Map();
+		const approvedEntries = [];
+		/**
+		* Batch-level accumulator for `additionalContext` strings returned
+		* by any PreToolUse / PostToolUse / PostToolUseFailure hook in this
+		* dispatch. We emit one consolidated `HumanMessage` after all tool
+		* results land so the next model turn sees the injected context
+		* exactly once, ordered after the ToolMessages.
+		*/
+		const batchAdditionalContexts = [];
+		/**
+		* Batch-level outcome record keyed by `tool_call_id`. Captures
+		* every tool call's final result (success / error from the host,
+		* blocked from HITL deny / reject, substituted from HITL respond)
+		* across the three call sites that touch it. We materialize the
+		* `PostToolBatch` entry array in `toolCalls` order at dispatch
+		* time so hooks correlating outcomes by position see exactly the
+		* same sequence the model emitted — independent of when each
+		* outcome was recorded (deny entries land synchronously in the
+		* hook loop, approved entries land after host execution, respond
+		* entries land in the resume branch).
+		*/
+		const postToolBatchEntryByCallId = /* @__PURE__ */ new Map();
+		const HOOK_FALLBACK = Object.freeze({
+			additionalContexts: [],
+			errors: []
+		});
+		if (this.hookRegistry?.hasHookFor("PreToolUse", runId) === true) {
+			/**
+			* Capture as a non-null local so the inner `blockEntry` closure
+			* doesn't lose narrowing on `this.hookRegistry` and we don't have
+			* to defensively `?.` it across every reference inside.
+			*/
+			const hookRegistry = this.hookRegistry;
+			const preResults = await Promise.all(preToolCalls.map((entry) => require_executeHooks.executeHooks({
+				registry: hookRegistry,
+				input: {
+					hook_event_name: "PreToolUse",
+					runId,
+					threadId,
+					agentId: this.agentId,
+					executingAgentId: this.executingAgentId,
+					toolName: entry.call.name,
+					toolInput: entry.args,
+					toolUseId: entry.call.id,
+					stepId: entry.stepId,
+					turn: this.toolUsageCount.get(entry.call.name) ?? 0
+				},
+				sessionId: runId,
+				matchQuery: entry.call.name
+			}).catch(() => HOOK_FALLBACK)));
+			/**
+			* Side effects deferred from `blockEntry` until after any pending
+			* `interrupt()` resolves. Without deferral, a batch that mixes a
+			* `deny` decision with an `ask` decision would dispatch
+			* `ON_RUN_STEP_COMPLETED` for the denied tool on the FIRST node
+			* execution (before `interrupt()` throws), then dispatch the
+			* same event AGAIN on the resume re-execution — hosts would
+			* observe two completion events for one logical denial. By
+			* queueing the dispatch + PermissionDenied hook here and
+			* flushing after the interrupt block, we ensure each side effect
+			* fires exactly once: never on the first pass when interrupt
+			* throws (the flush is unreachable), once on resume / no-ask
+			* passes when control reaches the flush.
+			*/
+			const deferredBlockedSideEffects = [];
+			const blockEntry = (entry, reason) => {
+				const contentString = `Blocked: ${reason}`;
+				messageByCallId.set(entry.call.id, new _langchain_core_messages.ToolMessage({
+					status: "error",
+					content: contentString,
+					name: entry.call.name,
+					tool_call_id: entry.call.id
+				}));
+				postToolBatchEntryByCallId.set(entry.call.id, {
+					toolName: entry.call.name,
+					toolInput: entry.args,
+					toolUseId: entry.call.id,
+					stepId: entry.stepId,
+					/**
+					* Records the pre-invocation turn count — the same value the
+					* executed path captures before incrementing `toolUsageCount`.
+					* For a blocked tool the counter is never incremented (no
+					* invocation happened), so this is always the count of prior
+					* successful invocations of this tool name in earlier batches.
+					* Surfaces in the `PostToolBatch` entry so batch hooks see
+					* a uniform shape regardless of outcome.
+					*/
+					turn: this.toolUsageCount.get(entry.call.name) ?? 0,
+					status: "error",
+					error: contentString
+				});
+				deferredBlockedSideEffects.push({
+					callId: entry.call.id,
+					toolName: entry.call.name,
+					args: entry.args,
+					contentString,
+					reason
+				});
+			};
+			const flushDeferredBlockedSideEffects = async () => {
+				for (const item of deferredBlockedSideEffects) {
+					await this.dispatchStepCompleted(item.callId, item.toolName, item.args, item.contentString, config);
+					if (hookRegistry.hasHookFor("PermissionDenied", runId)) require_executeHooks.executeHooks({
+						registry: hookRegistry,
+						input: {
+							hook_event_name: "PermissionDenied",
+							runId,
+							threadId,
+							agentId: this.agentId,
+							executingAgentId: this.executingAgentId,
+							toolName: item.toolName,
+							toolInput: item.args,
+							toolUseId: item.callId,
+							reason: item.reason
+						},
+						sessionId: runId,
+						matchQuery: item.toolName
+					}).catch(() => {});
+				}
+				deferredBlockedSideEffects.length = 0;
+			};
+			/**
+			* Apply a hook-supplied or host-supplied input override to a pending
+			* entry, re-running the `{{tool<i>turn<n>}}` resolver so any new
+			* placeholders introduced by the override are substituted (and any
+			* formerly-unresolved refs cleared from the unresolved set).
+			*
+			* Mixed direct+event batches must use the pre-batch snapshot so a
+			* hook-introduced placeholder cannot accidentally resolve to a
+			* same-turn direct output that has just registered. Pure event
+			* batches don't have a snapshot and resolve against the live
+			* registry — safe because no event-side registrations have happened
+			* yet.
+			*/
+			const applyInputOverride = (entry, nextArgs) => {
+				if (registry != null) {
+					const { resolved, unresolved } = (preBatchSnapshot ?? { resolve: (args) => registry.resolve(registryRunId, args) }).resolve(nextArgs);
+					entry.args = resolved;
+					if (entry.call.id != null) if (unresolved.length > 0) unresolvedByCallId.set(entry.call.id, unresolved);
+					else unresolvedByCallId.delete(entry.call.id);
+					return;
+				}
+				entry.args = nextArgs;
+			};
+			const askEntries = [];
+			for (let i = 0; i < preToolCalls.length; i++) {
+				const hookResult = preResults[i];
+				const entry = preToolCalls[i];
+				for (const ctx of hookResult.additionalContexts) batchAdditionalContexts.push(ctx);
+				if (hookResult.decision === "deny") {
+					blockEntry(entry, hookResult.reason ?? "Blocked by hook");
+					continue;
+				}
+				if (hookResult.decision === "ask") {
+					/**
+					* HITL is OFF by default — hosts must explicitly opt in via
+					* `humanInTheLoop: { enabled: true }` to engage the
+					* `interrupt()` path. When opted out (or omitted), `ask`
+					* collapses into the pre-HITL fail-closed path: a blocked
+					* tool with an error `ToolMessage`. The default stays
+					* conservative until host UIs are ready to render
+					* `tool_approval` interrupts; see `HumanInTheLoopConfig`
+					* JSDoc for the full rationale and the migration plan.
+					*/
+					if (this.humanInTheLoop?.enabled !== true) {
+						blockEntry(entry, hookResult.reason ?? "Blocked by hook");
+						continue;
+					}
+					/**
+					* Apply `updatedInput` BEFORE queuing into `askEntries` —
+					* a hook is allowed to return both a sanitization rewrite
+					* and an `ask` decision (e.g. one matcher redacts secrets,
+					* another matcher requires approval). Without this, the
+					* interrupt payload would surface the original args to the
+					* reviewer AND the post-approve execution would run with
+					* the original args, silently dropping the hook's rewrite.
+					*/
+					if (hookResult.updatedInput != null) applyInputOverride(entry, hookResult.updatedInput);
+					askEntries.push({
+						entry,
+						reason: hookResult.reason,
+						allowedDecisions: hookResult.allowedDecisions
+					});
+					continue;
+				}
+				if (hookResult.updatedInput != null) applyInputOverride(entry, hookResult.updatedInput);
+				approvedEntries.push(entry);
+			}
+			/**
+			* If any entries asked for approval, raise a single LangGraph
+			* `interrupt()` carrying every pending request together. The host
+			* pauses, gathers human input, and resumes the run with one
+			* decision per request. On resume LangGraph re-executes this node
+			* from the start; `interrupt()` then returns the resume value
+			* instead of throwing, so the loop above re-runs and the same
+			* `askEntries` list is rebuilt deterministically (assuming hooks
+			* are pure — see `humanInTheLoop` docs).
+			*/
+			if (askEntries.length > 0) {
+				const payload = buildToolApprovalInterruptPayload(askEntries);
+				/**
+				* `interrupt()` reads the current `RunnableConfig` from
+				* AsyncLocalStorage. ToolNode usually runs with tracing disabled
+				* (unless Langfuse explicitly enables it), so the upstream
+				* `runWithConfig` frame may not exist. Re-anchor here using the
+				* node's own `config` — Pregel hands us a config that already
+				* carries every checkpoint/scratchpad key `interrupt()` needs to
+				* suspend and resume.
+				*/
+				const resumeValue = _langchain_core_singletons.AsyncLocalStorageProviderSingleton.runWithConfig(config, () => (0, _langchain_langgraph.interrupt)(payload));
+				const decisionByCallId = normalizeApprovalDecisions(askEntries.map(({ entry }) => entry.call.id), resumeValue);
+				for (const { entry, reason: askReason, allowedDecisions } of askEntries) {
+					const decision = decisionByCallId.get(entry.call.id) ?? {
+						type: "reject",
+						reason: "No decision provided for tool approval"
+					};
+					/**
+					* Read `decision.type` through a widened view once: hosts
+					* deserialize resume payloads from untyped JSON, so the
+					* runtime value can be a typo, the wrong type, or missing
+					* entirely. Both the `allowedDecisions` enforcement
+					* immediately below and the unknown-type fallthrough at the
+					* end of this loop body share this single read so the
+					* fail-closed checks compare against the same source.
+					*/
+					const declaredType = decision.type;
+					/**
+					* Enforce the per-tool `allowedDecisions` allowlist that the
+					* `PreToolUse` hook surfaced in `review_configs`. The host
+					* UI is supposed to honor this when collecting the user's
+					* decision, but the wire is untrusted: a buggy or hostile
+					* host could submit a decision type the policy explicitly
+					* forbids (e.g. `'edit'` when the hook restricted to
+					* `['approve', 'reject']`), bypassing argument-mutation /
+					* response-substitution safeguards. Fail closed when the
+					* declared type isn't in the allowlist.
+					*/
+					if (allowedDecisions != null && (typeof declaredType !== "string" || !allowedDecisions.includes(declaredType))) {
+						blockEntry(entry, `Decision "${typeof declaredType === "string" ? declaredType : "<missing>"}" not in allowedDecisions [${allowedDecisions.join(", ")}] — failing closed`);
+						continue;
+					}
+					if (decision.type === "reject") {
+						blockEntry(entry, decision.reason ?? askReason ?? "Rejected by user");
+						continue;
+					}
+					/**
+					* `respond` short-circuits tool execution: the human supplies
+					* the result the model should see in place of running the
+					* tool. We emit a successful `ToolMessage` directly and skip
+					* dispatch — no host event fires, no real tool side effect
+					* occurs. Mirrors LangChain HITL middleware semantics.
+					*/
+					if (decision.type === "respond") {
+						/**
+						* Validate the wire shape before touching it: hosts
+						* deserialize resume payloads from untyped JSON, so a
+						* malformed `{ type: 'respond' }` (no `responseText`) or
+						* `{ type: 'respond', responseText: 42 }` would crash
+						* `truncateToolResultContent` (which calls
+						* `content.length`) and turn a fail-closed approval path
+						* into a hard run failure. Route bad shapes through
+						* `blockEntry` like any other unusable decision.
+						*/
+						const responseText = decision.responseText;
+						if (typeof responseText !== "string") {
+							blockEntry(entry, `Decision "respond" missing string responseText (got ${describeOfferedShape(responseText)}) — failing closed`);
+							continue;
+						}
+						/**
+						* Truncate the human-supplied text just like the success
+						* path does for real tool output. Without this, a user
+						* pasting a large document as a manual response bypasses
+						* `maxToolResultChars` and can blow past the model's
+						* context window. The PostToolBatch entry surfaces the
+						* truncated text too so batch hooks see what the model
+						* will actually see.
+						*/
+						const truncatedResponse = require_truncation.truncateToolResultContent(responseText, this.maxToolResultChars);
+						messageByCallId.set(entry.call.id, new _langchain_core_messages.ToolMessage({
+							status: "success",
+							content: truncatedResponse,
+							name: entry.call.name,
+							tool_call_id: entry.call.id
+						}));
+						postToolBatchEntryByCallId.set(entry.call.id, {
+							toolName: entry.call.name,
+							toolInput: entry.args,
+							toolUseId: entry.call.id,
+							stepId: entry.stepId,
+							turn: this.toolUsageCount.get(entry.call.name) ?? 0,
+							status: "success",
+							toolOutput: truncatedResponse
+						});
+						/**
+						* Safe to dispatch immediately — unlike `blockEntry` which
+						* defers, `respond` only executes inside the decision-
+						* processing loop, which is reachable only AFTER
+						* `interrupt()` has returned (the resume pass). There is
+						* no risk of being rolled back by a subsequent throw, so
+						* no risk of a duplicate `ON_RUN_STEP_COMPLETED` event.
+						*/
+						await this.dispatchStepCompleted(entry.call.id, entry.call.name, entry.args, truncatedResponse, config);
+						continue;
+					}
+					if (decision.type === "edit") {
+						/**
+						* Validate the wire shape before touching it: hosts
+						* deserialize resume payloads from untyped JSON, so a
+						* malformed `{ type: 'edit' }` (no `updatedInput`),
+						* `{ type: 'edit', updatedInput: 'string' }` (non-object),
+						* or `{ type: 'edit', updatedInput: [...] }` (array, not a
+						* plain object) would feed garbage into
+						* `applyInputOverride` and silently approve a tool with
+						* undefined / wrong-shape args. Same trust boundary as
+						* the `respond` validation above — fail closed via
+						* `blockEntry` with a diagnostic.
+						*/
+						const updatedInput = decision.updatedInput;
+						if (updatedInput === null || typeof updatedInput !== "object" || Array.isArray(updatedInput)) {
+							blockEntry(entry, `Decision "edit" missing object updatedInput (got ${describeOfferedShape(updatedInput)}) — failing closed`);
+							continue;
+						}
+						applyInputOverride(entry, updatedInput);
+						approvedEntries.push(entry);
+						continue;
+					}
+					/**
+					* Defensive type widening: hosts deserialize resume payloads
+					* from untyped JSON, so the `decision.type` value at runtime
+					* is whatever string the wire sent — not necessarily one of
+					* the four union variants TS knows about. We compare against
+					* the literal `'approve'` through the widened `declaredType`
+					* captured at the top of this iteration, so a typo or schema
+					* drift (`'aproved'`, `null`, `undefined`) hits the fail-
+					* closed branch below instead of silently approving the
+					* tool. Without this widening, TS narrows the union after
+					* the three earlier branches and treats `=== 'approve'` as
+					* trivially true.
+					*/
+					if (declaredType === "approve") {
+						approvedEntries.push(entry);
+						continue;
+					}
+					blockEntry(entry, `Unknown approval decision type "${typeof declaredType === "string" ? declaredType : "<missing>"}" — failing closed`);
+				}
+			}
+			/**
+			* Flush deferred denial side effects exactly once. On the FIRST
+			* pass through a batch that contains an `ask`, `interrupt()`
+			* threw above and we never reach this line — so no
+			* `ON_RUN_STEP_COMPLETED` / `PermissionDenied` events fire
+			* for blocked tools yet. On resume the node re-executes from
+			* scratch, `blockEntry` re-queues the same entries, and the
+			* flush below dispatches them once. For batches without any
+			* `ask` (deny-only or empty), the flush still runs here and
+			* dispatches in the same relative position as the pre-deferral
+			* code did (after hook processing, before tool execution).
+			*/
+			await flushDeferredBlockedSideEffects();
+		} else approvedEntries.push(...preToolCalls);
+		const injected = [];
+		const batchIndexByCallId = /* @__PURE__ */ new Map();
+		if (approvedEntries.length > 0) {
+			const plan = require_eagerEventExecution.buildToolExecutionRequestPlan({
+				toolCalls: approvedEntries.map((entry) => {
+					const codeSessionContext = require_enum.CODE_EXECUTION_TOOLS.has(entry.call.name) || entry.call.name === "skill" || entry.call.name === "read_file" ? this.getCodeSessionContext() : void 0;
+					return {
+						id: entry.call.id,
+						name: entry.call.name,
+						args: entry.args,
+						stepId: entry.stepId,
+						codeSessionContext
+					};
+				}),
+				usageCount: this.toolUsageCount,
+				invalidArgsBehavior: "error-result",
+				recordTurn: (toolName, reservedTurn, callId) => {
+					this.recordEventToolPlanningTurn(toolName, reservedTurn, callId);
+				}
+			});
+			if (plan == null) throw new Error("Unable to build event tool execution request plan");
+			const requests = plan.requests;
+			for (const entry of approvedEntries) if (entry.batchIndex != null && entry.call.id != null) batchIndexByCallId.set(entry.call.id, entry.batchIndex);
+			for (const result of plan.rejectedResults) this.eagerEventToolExecutions?.delete(result.toolCallId);
+			const requestMap = new Map(plan.allRequests.map((r) => [r.id, r]));
+			const eagerExecutions = [];
+			const dispatchRequests = [];
+			for (const request of requests) {
+				const eagerExecution = this.takeMatchingEagerEventExecution(request);
+				if (eagerExecution != null) eagerExecutions.push({
+					request,
+					execution: eagerExecution
+				});
+				else dispatchRequests.push(request);
+			}
+			/**
+			* Per-call completion fast-path: when the host reports a result
+			* through `onResult` before the batch resolves, emit that call's
+			* completed run step immediately instead of waiting for the slowest
+			* call in the batch. Safe only when nothing can change the result
+			* after execution — post-tool hooks may rewrite output and HITL may
+			* deny a call, so those configurations keep batch-time emission.
+			* Ids are claimed synchronously before the async dispatch and
+			* released if the dispatch fails, letting the batch path re-emit.
+			*/
+			const canEmitEarlyCompletions = this.hookRegistry == null && this.humanInTheLoop?.enabled !== true;
+			const earlyCompletionDispatchedIds = /* @__PURE__ */ new Set();
+			const earlyCompletionDispatches = [];
+			const dispatchRequestById = new Map(dispatchRequests.map((request) => [request.id, request]));
+			const onResult = (result) => {
+				const request = result.toolCallId != null ? dispatchRequestById.get(result.toolCallId) : void 0;
+				if (request == null || earlyCompletionDispatchedIds.has(result.toolCallId)) return;
+				earlyCompletionDispatchedIds.add(result.toolCallId);
+				earlyCompletionDispatches.push(this.dispatchEarlyToolCompletion(result, request, config).then((dispatched) => {
+					if (!dispatched) earlyCompletionDispatchedIds.delete(result.toolCallId);
+				}, () => {
+					earlyCompletionDispatchedIds.delete(result.toolCallId);
+				}));
+			};
+			const dispatchPromise = dispatchRequests.length === 0 ? Promise.resolve([]) : new Promise((resolve, reject) => {
+				let dispatchSettled = false;
+				let resultSettled = false;
+				let settledResults;
+				const maybeResolve = () => {
+					if (dispatchSettled && resultSettled) resolve(settledResults ?? []);
+				};
+				const batchRequest = {
+					toolCalls: dispatchRequests,
+					userId: config.configurable?.user_id,
+					agentId: this.agentId,
+					configurable: config.configurable,
+					metadata: config.metadata,
+					resolve: (results) => {
+						resultSettled = true;
+						settledResults = results;
+						maybeResolve();
+					},
+					reject,
+					...canEmitEarlyCompletions && { onResult }
+				};
+				require_events.safeDispatchCustomEvent("on_tool_execute", batchRequest, config).then(() => {
+					dispatchSettled = true;
+					maybeResolve();
+				}).catch(reject);
+			});
+			const eagerResultsPromise = Promise.all(eagerExecutions.map(async ({ request, execution }) => {
+				return {
+					results: await this.resolveEagerEventExecution(request, execution),
+					completionDispatched: execution.completionDispatched === true && execution.request.turn === request.turn,
+					toolCallId: request.id
+				};
+			}));
+			const [eagerResults, dispatchedResults] = await Promise.all([eagerResultsPromise, dispatchPromise]);
+			await Promise.allSettled(earlyCompletionDispatches);
+			const eagerCompletionDispatchedIds = new Set(eagerResults.filter((result) => result.completionDispatched).map((result) => result.toolCallId));
+			const flattenedEagerResults = eagerResults.flatMap((result) => result.results);
+			const results = [
+				...plan.rejectedResults,
+				...flattenedEagerResults,
+				...dispatchedResults
+			];
+			this.storeCodeSessionFromResults(results, requestMap);
+			const hasPostHook = this.hookRegistry?.hasHookFor("PostToolUse", runId) === true;
+			const hasFailureHook = this.hookRegistry?.hasHookFor("PostToolUseFailure", runId) === true;
+			for (const result of results) {
+				if (result.injectedMessages && result.injectedMessages.length > 0) try {
+					injected.push(...this.convertInjectedMessages(result.injectedMessages));
+				} catch (e) {
+					console.warn(`[ToolNode] Failed to convert injectedMessages for toolCallId=${result.toolCallId}:`, e instanceof Error ? e.message : e);
+				}
+				const request = requestMap.get(result.toolCallId);
+				const toolName = request?.name ?? "unknown";
+				let contentString;
+				let toolMessage;
+				/**
+				* Tracks the post-PostToolUse-hook output so the
+				* `PostToolBatch` entry below sees the final transformed value
+				* even when a hook replaced the original via `updatedOutput`.
+				* Lives at the loop-iteration scope so the success branch can
+				* mutate it; the error branch leaves it unset (and the batch
+				* entry uses `error` instead of `toolOutput` in that case).
+				*/
+				let finalToolOutput = result.content;
+				if (result.status === "error") {
+					contentString = `Error: ${result.errorMessage ?? "Unknown error"}\n Please fix your mistakes.`;
+					/**
+					* Error results bypass registration but stamp the
+					* unresolved-refs hint into `additional_kwargs` so the lazy
+					* annotation transform surfaces it to the LLM at request
+					* time, letting the model self-correct when its reference
+					* key caused the failure. Persisted `content` stays clean.
+					*/
+					const unresolved = unresolvedByCallId.get(result.toolCallId) ?? [];
+					const errorRefMeta = unresolved.length > 0 ? this.recordOutputReference(registryRunId, contentString, void 0, unresolved) : void 0;
+					toolMessage = new _langchain_core_messages.ToolMessage({
+						status: "error",
+						content: contentString,
+						name: toolName,
+						tool_call_id: result.toolCallId,
+						...errorRefMeta != null && { additional_kwargs: errorRefMeta }
+					});
+					if (hasFailureHook) {
+						const failureHookResult = await require_executeHooks.executeHooks({
+							registry: this.hookRegistry,
+							input: {
+								hook_event_name: "PostToolUseFailure",
+								runId,
+								threadId,
+								agentId: this.agentId,
+								executingAgentId: this.executingAgentId,
+								toolName,
+								toolInput: request?.args ?? {},
+								toolUseId: result.toolCallId,
+								error: result.errorMessage ?? "Unknown error",
+								stepId: request?.stepId,
+								turn: request?.turn
+							},
+							sessionId: runId,
+							matchQuery: toolName
+						}).catch(() => void 0);
+						/**
+						* Collect `additionalContext` from failure hooks too. Without
+						* this, recovery guidance returned on tool errors (e.g.
+						* "if this tool errors with X, suggest Y to the user") is
+						* silently dropped even though the API surface advertises
+						* `additionalContext` for this event. PostToolUseFailure
+						* remains observational for errors thrown by the hook
+						* itself, but a successfully-returned result is honored.
+						*/
+						if (failureHookResult != null) for (const ctx of failureHookResult.additionalContexts) batchAdditionalContexts.push(ctx);
+					}
+				} else {
+					let registryRaw = typeof result.content === "string" ? result.content : JSON.stringify(result.content);
+					contentString = require_truncation.truncateToolResultContent(registryRaw, this.maxToolResultChars);
+					if (hasPostHook) {
+						const hookResult = await require_executeHooks.executeHooks({
+							registry: this.hookRegistry,
+							input: {
+								hook_event_name: "PostToolUse",
+								runId,
+								threadId,
+								agentId: this.agentId,
+								executingAgentId: this.executingAgentId,
+								toolName,
+								toolInput: request?.args ?? {},
+								toolOutput: result.content,
+								toolUseId: result.toolCallId,
+								stepId: request?.stepId,
+								turn: request?.turn
+							},
+							sessionId: runId,
+							matchQuery: toolName
+						}).catch(() => void 0);
+						if (hookResult != null) for (const ctx of hookResult.additionalContexts) batchAdditionalContexts.push(ctx);
+						if (hookResult?.updatedOutput != null) {
+							const replaced = typeof hookResult.updatedOutput === "string" ? hookResult.updatedOutput : JSON.stringify(hookResult.updatedOutput);
+							registryRaw = replaced;
+							contentString = require_truncation.truncateToolResultContent(replaced, this.maxToolResultChars);
+							finalToolOutput = hookResult.updatedOutput;
+						}
+					}
+					const batchIndex = batchIndexByCallId.get(result.toolCallId);
+					const unresolved = unresolvedByCallId.get(result.toolCallId) ?? [];
+					const refKey = this.toolOutputRegistry != null && batchIndex != null && turn != null ? require_toolOutputReferences.buildReferenceKey(batchIndex, turn) : void 0;
+					const successRefMeta = this.recordOutputReference(registryRunId, require_CodeSessionFileSummary.stripCodeSessionFileSummary(registryRaw), refKey, unresolved);
+					toolMessage = new _langchain_core_messages.ToolMessage({
+						status: "success",
+						name: toolName,
+						content: contentString,
+						artifact: result.artifact,
+						tool_call_id: result.toolCallId,
+						...successRefMeta != null && { additional_kwargs: successRefMeta }
+					});
+				}
+				if (!eagerCompletionDispatchedIds.has(result.toolCallId) && !earlyCompletionDispatchedIds.has(result.toolCallId)) await this.dispatchStepCompleted(result.toolCallId, toolName, request?.args ?? {}, contentString, config, request?.turn);
+				postToolBatchEntryByCallId.set(result.toolCallId, {
+					toolName,
+					toolInput: request?.args ?? {},
+					toolUseId: result.toolCallId,
+					stepId: request?.stepId,
+					turn: request?.turn,
+					status: result.status === "error" ? "error" : "success",
+					...result.status === "error" ? { error: result.errorMessage ?? "Unknown error" } : { toolOutput: finalToolOutput }
+				});
+				messageByCallId.set(result.toolCallId, toolMessage);
+			}
+		}
+		const toolMessages = toolCalls.map((call) => messageByCallId.get(call.id)).filter((m) => m != null);
+		await this.dispatchPostToolBatchAndInjectContext({
+			toolCalls,
+			entriesByCallId: postToolBatchEntryByCallId,
+			batchAdditionalContexts,
+			injected,
+			runId,
+			threadId
+		});
+		return {
+			toolMessages,
+			injected
+		};
+	}
+	canConsumeEagerEventExecution() {
+		return this.eventDrivenMode && this.eagerEventToolExecution?.enabled === true && this.hookRegistry == null && this.humanInTheLoop?.enabled !== true;
+	}
+	takeMatchingEagerEventExecution(request) {
+		if (!this.canConsumeEagerEventExecution()) return;
+		const execution = this.eagerEventToolExecutions?.get(request.id);
+		if (execution == null) return;
+		this.eagerEventToolExecutions?.delete(request.id);
+		if (execution.toolName !== request.name || !require_eagerEventExecution.recordArgsEqual(execution.args, request.args)) return {
+			toolCallId: request.id,
+			toolName: request.name,
+			args: request.args,
+			request,
+			promise: Promise.resolve({ results: [{
+				toolCallId: request.id,
+				status: "error",
+				content: "",
+				errorMessage: "Tool call changed after eager execution started; refusing to re-run the tool to avoid duplicate side effects."
+			}] })
+		};
+		return execution;
+	}
+	async resolveEagerEventExecution(request, execution) {
+		const outcome = await execution.promise;
+		if (outcome.error != null) throw outcome.error;
+		const results = outcome.results.filter((result) => result.toolCallId === request.id);
+		if (results.length > 0) return results;
+		return [{
+			toolCallId: request.id,
+			status: "error",
+			content: "",
+			errorMessage: "Tool execution completed without a result for this tool call"
+		}];
+	}
+	/**
+	* Fires the `PostToolBatch` hook (if registered) and appends the
+	* accumulated batch-level `additionalContext` strings to `injected`
+	* as a single `HumanMessage`. Entries are materialized in the
+	* original `toolCalls` order so hooks correlating outcomes by
+	* position (as the type docs promise) see exactly the sequence
+	* the model emitted, regardless of when each individual outcome
+	* was recorded into the map (deny synchronous, approved
+	* post-execution, respond on resume).
+	*
+	* The PostToolBatch hook's `additionalContexts` flow into the same
+	* batch accumulator per-tool hooks already use, so a single
+	* batch-level convention message can be injected through one path.
+	*
+	* Mutates `batchAdditionalContexts` (push from batch hook) and
+	* `injected` (push the consolidated HumanMessage). The caller owns
+	* those arrays and consumes them right after this returns.
+	*/
+	async dispatchPostToolBatchAndInjectContext(args) {
+		const { toolCalls, entriesByCallId, batchAdditionalContexts, injected, runId, threadId } = args;
+		const orderedBatchEntries = [];
+		for (const call of toolCalls) {
+			const callId = call.id;
+			if (callId == null) continue;
+			const entry = entriesByCallId.get(callId);
+			if (entry != null) orderedBatchEntries.push(entry);
+		}
+		if (this.hookRegistry?.hasHookFor("PostToolBatch", runId) === true && orderedBatchEntries.length > 0) {
+			const batchHookResult = await require_executeHooks.executeHooks({
+				registry: this.hookRegistry,
+				input: {
+					hook_event_name: "PostToolBatch",
+					runId,
+					threadId,
+					agentId: this.agentId,
+					executingAgentId: this.executingAgentId,
+					entries: orderedBatchEntries
+				},
+				sessionId: runId
+			}).catch(() => void 0);
+			if (batchHookResult != null) for (const ctx of batchHookResult.additionalContexts) batchAdditionalContexts.push(ctx);
+		}
+		if (batchAdditionalContexts.length > 0)
+ /**
+		* `HumanMessage` carrying a metadata `role: 'system'` marker —
+		* see `convertInjectedMessages` for the wider rationale. Anthropic
+		* and Google reject mid-conversation `SystemMessage`s, so we use
+		* a user-role message and surface the system intent through
+		* `additional_kwargs` for hosts inspecting state. The model sees
+		* a user message; `role` is metadata only.
+		*/
+		injected.push(new _langchain_core_messages.HumanMessage({
+			content: batchAdditionalContexts.join("\n\n"),
+			additional_kwargs: {
+				role: "system",
+				source: "hook"
+			}
+		}));
+	}
+	async dispatchStepCompleted(toolCallId, toolName, args, output, config, turn) {
+		const stepId = this.toolCallStepIds?.get(toolCallId) ?? "";
+		if (!stepId) console.warn(`[ToolNode] toolCallStepIds missing entry for toolCallId=${toolCallId} (tool=${toolName}). This indicates a race between the stream consumer and graph execution. Map size: ${this.toolCallStepIds?.size ?? 0}`);
+		return await require_events.safeDispatchCustomEvent("on_run_step_completed", { result: {
+			id: stepId,
+			index: turn ?? this.toolUsageCount.get(toolName) ?? 0,
+			type: "tool_call",
+			tool_call: {
+				args: JSON.stringify(args),
+				name: toolName,
+				id: toolCallId,
+				output,
+				progress: 1
+			}
+		} }, config) !== false;
+	}
+	/**
+	* Emits the completed run step for a single host-reported result before
+	* the batch resolves. Mirrors the batch loop's output formatting exactly;
+	* callers gate on the no-hooks/no-HITL configuration, so the raw result
+	* content here is also the final content. Returns whether the event was
+	* actually dispatched so the caller can fall back to batch-time emission.
+	*/
+	async dispatchEarlyToolCompletion(result, request, config) {
+		const output = result.status === "error" ? `Error: ${result.errorMessage ?? "Unknown error"}\n Please fix your mistakes.` : require_truncation.truncateToolResultContent(typeof result.content === "string" ? result.content : JSON.stringify(result.content), this.maxToolResultChars);
+		return this.dispatchStepCompleted(result.toolCallId, request.name, request.args, output, config, request.turn);
+	}
+	/**
+	* Converts InjectedMessage instances to LangChain HumanMessage objects.
+	* Both 'user' and 'system' roles become HumanMessage to avoid provider
+	* rejections (Anthropic/Google reject non-leading SystemMessages).
+	* The original role is preserved in additional_kwargs for downstream consumers.
+	*/
+	convertInjectedMessages(messages) {
+		const converted = [];
+		for (const msg of messages) {
+			const additional_kwargs = { role: msg.role };
+			if (msg.isMeta != null) additional_kwargs.isMeta = msg.isMeta;
+			if (msg.source != null) additional_kwargs.source = msg.source;
+			if (msg.skillName != null) additional_kwargs.skillName = msg.skillName;
+			converted.push(new _langchain_core_messages.HumanMessage({
+				content: require_langchain.toLangChainContent(msg.content),
+				additional_kwargs
+			}));
+		}
+		return converted;
+	}
+	/**
+	* Execute all tool calls via ON_TOOL_EXECUTE event dispatch.
+	* Injected messages are placed AFTER ToolMessages to respect provider
+	* message ordering (AIMessage tool_calls must be immediately followed
+	* by their ToolMessage results).
+	*
+	* `batchIndices` mirrors `toolCalls` and carries each call's position
+	* within the parent batch. `turn` is the per-`run()` batch index
+	* captured locally by the caller. Both are threaded so concurrent
+	* invocations cannot race on shared mutable state.
+	*/
+	async executeViaEvent(toolCalls, config, input, batchContext = {}) {
+		const { toolMessages, injected } = await this.dispatchToolEvents(toolCalls, config, batchContext);
+		const outputs = [...toolMessages, ...injected];
+		return Array.isArray(input) ? outputs : { messages: outputs };
+	}
+	async run(input, config) {
+		this.toolCallTurns.clear();
+		/**
+		* Per-batch local map for resolved (post-substitution) args.
+		* Lives on the stack so concurrent `run()` calls on the same
+		* ToolNode cannot read or wipe each other's entries.
+		*/
+		const resolvedArgsByCallId = /* @__PURE__ */ new Map();
+		const batchScopeId = config.configurable?.run_id ?? `\0anon-${this.anonBatchCounter++}`;
+		const turn = this.toolOutputRegistry?.nextTurn(batchScopeId) ?? 0;
+		let outputs;
+		if (this.isSendInput(input)) {
+			const isLocalTool = this.directToolNames?.has(input.lg_tool_call.name) === true || this.shouldHandleUnknownHandoffLocally(input.lg_tool_call.name);
+			if (this.eventDrivenMode && !isLocalTool) return this.executeViaEvent([input.lg_tool_call], config, input, {
+				batchIndices: [0],
+				turn,
+				batchScopeId
+			});
+			const directAdditionalContexts = [];
+			const sendOutput = await this.runDirectToolWithLifecycleHooks(input.lg_tool_call, config, {
+				batchIndex: 0,
+				turn,
+				batchScopeId,
+				resolvedArgsByCallId,
+				additionalContextsSink: directAdditionalContexts
+			});
+			outputs = directAdditionalContexts.length > 0 ? [sendOutput, new _langchain_core_messages.HumanMessage({
+				content: directAdditionalContexts.join("\n\n"),
+				additional_kwargs: {
+					role: "system",
+					source: "hook"
+				}
+			})] : [sendOutput];
+			await this.handleRunToolCompletions([input.lg_tool_call], [sendOutput], config, resolvedArgsByCallId);
+		} else {
+			let messages;
+			if (Array.isArray(input)) messages = input;
+			else if (this.isMessagesState(input)) messages = input.messages;
+			else throw new Error("ToolNode only accepts BaseMessage[] or { messages: BaseMessage[] } as input.");
+			const toolMessageIds = new Set(messages.filter((msg) => msg._getType() === "tool").map((msg) => msg.tool_call_id));
+			let aiMessage;
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const message = messages[i];
+				if ((0, _langchain_core_messages.isAIMessage)(message)) {
+					aiMessage = message;
+					break;
+				}
+			}
+			if (aiMessage == null || !(0, _langchain_core_messages.isAIMessage)(aiMessage)) throw new Error("ToolNode only accepts AIMessages as input.");
+			if (this.loadRuntimeTools) {
+				const { tools, toolMap } = this.loadRuntimeTools(aiMessage.tool_calls ?? []);
+				this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
+				this.applyToolExecutionOverrides();
+				this.programmaticCache = void 0;
+			}
+			const filteredCalls = aiMessage.tool_calls?.filter((call) => {
+				/**
+				* Filter out:
+				* 1. Already processed tool calls (present in toolMessageIds)
+				* 2. Server tool calls (e.g., web_search with IDs starting with 'srvtoolu_')
+				*    which are executed by the provider's API and don't require invocation
+				*/
+				return (call.id == null || !toolMessageIds.has(call.id)) && !(call.id?.startsWith("srvtoolu_") ?? false);
+			}) ?? [];
+			if (this.eventDrivenMode && filteredCalls.length > 0) {
+				const directToolNames = this.directToolNames;
+				const hasRegisteredHandoffTool = this.hasRegisteredHandoffTool();
+				const directEntries = [];
+				const eventEntries = [];
+				for (let i = 0; i < filteredCalls.length; i++) {
+					const call = filteredCalls[i];
+					const entry = {
+						call,
+						batchIndex: i
+					};
+					if (directToolNames?.has(call.name) === true || this.shouldHandleUnknownHandoffLocally(call.name, hasRegisteredHandoffTool)) directEntries.push(entry);
+					else eventEntries.push(entry);
+				}
+				if (directEntries.length === 0) return this.executeViaEvent(filteredCalls, config, input, {
+					batchIndices: eventEntries.map((entry) => entry.batchIndex),
+					turn,
+					batchScopeId
+				});
+				const directCalls = directEntries.map((e) => e.call);
+				const directIndices = directEntries.map((e) => e.batchIndex);
+				const eventCalls = eventEntries.map((e) => e.call);
+				const eventIndices = eventEntries.map((e) => e.batchIndex);
+				/**
+				* Snapshot the event calls' args against the *pre-batch*
+				* registry state synchronously, before any await runs. The
+				* directs are then awaited first (preserving fail-fast
+				* semantics — a thrown error in a direct tool, e.g. with
+				* `handleToolErrors=false` or a `GraphInterrupt`, aborts
+				* before we dispatch any event-driven tools to the host).
+				* Because the event args were captured pre-await, they stay
+				* isolated from same-turn direct outputs that register
+				* during the await.
+				*/
+				const preResolvedEventArgs = /* @__PURE__ */ new Map();
+				/**
+				* Take a frozen snapshot of the registry state before any
+				* direct registrations land. The snapshot resolves
+				* placeholders against this point-in-time view, so a
+				* `PreToolUse` hook later rewriting event args via
+				* `updatedInput` can introduce placeholders that resolve
+				* cross-batch (against prior runs) without ever picking up
+				* same-turn direct outputs.
+				*/
+				const preBatchSnapshot = this.toolOutputRegistry?.snapshot(batchScopeId);
+				if (preBatchSnapshot != null) {
+					for (const entry of eventEntries) if (entry.call.id != null) {
+						const { resolved, unresolved } = preBatchSnapshot.resolve(entry.call.args);
+						preResolvedEventArgs.set(entry.call.id, {
+							resolved,
+							unresolved
+						});
+					}
+				}
+				const directAdditionalContexts = [];
+				const directOutputs = directCalls.length > 0 ? await Promise.all(directCalls.map((call, i) => this.runDirectToolWithLifecycleHooks(call, config, {
+					batchIndex: directIndices[i],
+					turn,
+					batchScopeId,
+					resolvedArgsByCallId,
+					preBatchSnapshot,
+					additionalContextsSink: directAdditionalContexts
+				}))) : [];
+				if (directCalls.length > 0 && directOutputs.length > 0) await this.handleRunToolCompletions(directCalls, directOutputs, config, resolvedArgsByCallId);
+				const eventResult = eventCalls.length > 0 ? await this.dispatchToolEvents(eventCalls, config, {
+					batchIndices: eventIndices,
+					turn,
+					batchScopeId,
+					preResolvedArgs: preResolvedEventArgs,
+					preBatchSnapshot
+				}) : {
+					toolMessages: [],
+					injected: []
+				};
+				const directInjected = directAdditionalContexts.length > 0 ? [new _langchain_core_messages.HumanMessage({
+					content: directAdditionalContexts.join("\n\n"),
+					additional_kwargs: {
+						role: "system",
+						source: "hook"
+					}
+				})] : [];
+				outputs = [
+					...directOutputs,
+					...eventResult.toolMessages,
+					...directInjected,
+					...eventResult.injected
+				];
+			} else {
+				const preBatchSnapshot = this.toolOutputRegistry?.snapshot(batchScopeId);
+				const directAdditionalContexts = [];
+				const toolOutputs = await Promise.all(filteredCalls.map((call, i) => this.runDirectToolWithLifecycleHooks(call, config, {
+					batchIndex: i,
+					turn,
+					batchScopeId,
+					resolvedArgsByCallId,
+					preBatchSnapshot,
+					additionalContextsSink: directAdditionalContexts
+				})));
+				await this.handleRunToolCompletions(filteredCalls, toolOutputs, config, resolvedArgsByCallId);
+				outputs = directAdditionalContexts.length > 0 ? [...toolOutputs, new _langchain_core_messages.HumanMessage({
+					content: directAdditionalContexts.join("\n\n"),
+					additional_kwargs: {
+						role: "system",
+						source: "hook"
+					}
+				})] : toolOutputs;
+			}
+		}
+		if (!outputs.some(_langchain_langgraph.isCommand)) return Array.isArray(input) ? outputs : { messages: outputs };
+		const combinedOutputs = [];
+		let parentCommand = null;
+		/**
+		* Collect handoff commands (Commands with string goto and Command.PARENT)
+		* for potential parallel handoff aggregation
+		*/
+		const handoffCommands = [];
+		const nonCommandOutputs = [];
+		for (const output of outputs) if ((0, _langchain_langgraph.isCommand)(output)) if (output.graph === _langchain_langgraph.Command.PARENT && Array.isArray(output.goto) && output.goto.every((send) => isSend(send)))
+ /** Aggregate Send-based commands */
+		if (parentCommand) parentCommand.goto.push(...output.goto);
+		else parentCommand = new _langchain_langgraph.Command({
+			graph: _langchain_langgraph.Command.PARENT,
+			goto: output.goto
+		});
+		else if (output.graph === _langchain_langgraph.Command.PARENT) {
+			/**
+			* Handoff Command with destination.
+			* Handle both string ('agent') and array (['agent']) formats.
+			* Collect for potential parallel aggregation.
+			*/
+			const goto = output.goto;
+			const isSingleStringDest = typeof goto === "string";
+			const isSingleArrayDest = Array.isArray(goto) && goto.length === 1 && typeof goto[0] === "string";
+			if (isSingleStringDest || isSingleArrayDest) handoffCommands.push(output);
+			else
+ /** Multi-destination or other command - pass through */
+			combinedOutputs.push(output);
+		} else
+ /** Other commands - pass through */
+		combinedOutputs.push(output);
+		else {
+			nonCommandOutputs.push(output);
+			combinedOutputs.push(Array.isArray(input) ? [output] : { messages: [output] });
+		}
+		/**
+		* Handle handoff commands - convert to Send objects for parallel execution
+		* when multiple handoffs are requested
+		*/
+		if (handoffCommands.length > 1) {
+			/**
+			* Multiple parallel handoffs - convert to Send objects.
+			* Each Send carries its own state with the appropriate messages.
+			* This enables LLM-initiated parallel execution when calling multiple
+			* transfer tools simultaneously.
+			*/
+			/** Collect all destinations for sibling tracking */
+			const allDestinations = handoffCommands.map((cmd) => {
+				const goto = cmd.goto;
+				return typeof goto === "string" ? goto : goto[0];
+			});
+			const sends = handoffCommands.map((cmd, idx) => {
+				const destination = allDestinations[idx];
+				/** Get siblings (other destinations, not this one) */
+				const siblings = allDestinations.filter((d) => d !== destination);
+				/** Add siblings to ToolMessage additional_kwargs */
+				const update = cmd.update;
+				if (update && update.messages) {
+					for (const msg of update.messages) if (msg.getType() === "tool") msg.additional_kwargs.handoff_parallel_siblings = siblings;
+				}
+				return new _langchain_langgraph.Send(destination, cmd.update);
+			});
+			const parallelCommand = new _langchain_langgraph.Command({
+				graph: _langchain_langgraph.Command.PARENT,
+				goto: sends
+			});
+			combinedOutputs.push(parallelCommand);
+		} else if (handoffCommands.length === 1)
+ /** Single handoff - pass through as-is */
+		combinedOutputs.push(handoffCommands[0]);
+		if (parentCommand) combinedOutputs.push(parentCommand);
+		return combinedOutputs;
+	}
+	isSendInput(input) {
+		return typeof input === "object" && input != null && "lg_tool_call" in input;
+	}
+	isMessagesState(input) {
+		return typeof input === "object" && input != null && "messages" in input && Array.isArray(input.messages) && input.messages.every(_langchain_core_messages.isBaseMessage);
+	}
+};
+function areToolCallsInvoked(message, invokedToolIds) {
+	if (!invokedToolIds || invokedToolIds.size === 0) return false;
+	return message.tool_calls?.every((toolCall) => toolCall.id != null && invokedToolIds.has(toolCall.id)) ?? false;
+}
+function toolsCondition(state, toolNode, invokedToolIds) {
+	const messages = Array.isArray(state) ? state : state.messages;
+	const message = messages[messages.length - 1];
+	if (message && "tool_calls" in message && (message.tool_calls?.length ?? 0) > 0 && !areToolCallsInvoked(message, invokedToolIds)) return toolNode;
+	return _langchain_langgraph.END;
+}
+//#endregion
+exports.ToolNode = ToolNode;
+exports.toolsCondition = toolsCondition;
+
+//# sourceMappingURL=ToolNode.cjs.map

@@ -23,6 +23,7 @@ services:
       - ./patches/stream.cjs:/app/node_modules/@librechat/agents/dist/cjs/stream.cjs:ro
       - ./patches/completions.js:/app/node_modules/@langchain/openai/dist/converters/completions.js:ro
       - ./patches/completions.cjs:/app/node_modules/@langchain/openai/dist/converters/completions.cjs:ro
+      - ./patches/ToolNode.cjs:/app/node_modules/@librechat/agents/dist/cjs/tools/ToolNode.cjs:ro
       # - ./index.html:/app/client/dist/index.html
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -259,3 +259,20 @@ export const useFilePreview = (
     },
   );
 };
+
+export const useGetStorageUsage = (
+  config?: UseQueryOptions<{ used: number; limit: number }, unknown>,
+): QueryObserverResult<{ used: number; limit: number }, unknown> => {
+  const queriesEnabled = useRecoilValue<boolean>(store.queriesEnabled);
+  return useQuery<{ used: number; limit: number }, unknown>(
+    ['storageUsage'],
+    () => dataService.getStorageUsage(),
+    {
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
+      staleTime: 60_000,
+      ...config,
+      enabled: (config?.enabled ?? true) === true && queriesEnabled,
+    },
+  );
+};
