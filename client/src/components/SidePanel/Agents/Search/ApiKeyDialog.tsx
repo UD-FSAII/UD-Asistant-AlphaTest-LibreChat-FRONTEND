@@ -68,13 +68,23 @@ export default function ApiKeyDialog({
       key: SearchProviders.SEARXNG,
       label: localize('com_ui_web_search_provider_searxng'),
       inputs: {
-        searxngInstanceUrl: {
-          placeholder: localize('com_ui_web_search_searxng_instance_url'),
-          type: 'text' as const,
-        },
+        /**
+         * UD Assistant: the instance URL is supplied by the server
+         * (SEARXNG_INSTANCE_URL) and testers can't know it — leaving the field
+         * visible invites a blank submission that overrides a working value.
+         * Only the per-user Brave key is collected here.
+         */
+        // searxngInstanceUrl: {
+        //   placeholder: localize('com_ui_web_search_searxng_instance_url'),
+        //   type: 'text' as const,
+        // },
         searxngApiKey: {
           placeholder: localize('com_ui_web_search_searxng_api_key'),
           type: 'password' as const,
+          link: {
+            url: 'https://api-dashboard.search.brave.com/app/keys',
+            text: localize('com_ui_web_search_searxng_api_key_link'),
+          },
         },
       },
     },

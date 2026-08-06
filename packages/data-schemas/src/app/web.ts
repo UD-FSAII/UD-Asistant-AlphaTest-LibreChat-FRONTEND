@@ -10,7 +10,7 @@ export const webSearchAuth = {
     searxng: {
       searxngInstanceUrl: 1 as const,
       /** Optional (0) */
-      searxngApiKey: 0 as const,
+      searxngApiKey: 1 as const,
     },
     tavily: {
       tavilyApiKey: 1 as const,
