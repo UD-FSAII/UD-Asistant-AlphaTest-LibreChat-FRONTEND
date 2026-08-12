@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
 const { logger, getTenantId, webSearchKeys } = require('@librechat/data-schemas');
 const {
   getNewS3URL,
@@ -630,8 +631,56 @@ const maybeUninstallOAuthMCP = async (userId, pluginKey, appConfig) => {
   await clearStoredMCPOAuthState(userId, serverName);
 };
 
+/**
+ * Addition: let a logged-in user change their own password.
+ *
+ * Accounts are admin-created and ALLOW_PASSWORD_RESET=false (no SMTP), so
+ * upstream's email-link reset flow is unavailable. This is the in-session
+ * equivalent: prove you know the current password, set a new one. It is NOT a
+ * recovery path — a user who forgets their password still needs an admin.
+ */
+const changePasswordController = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body ?? {};
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ message: 'Current and new password are required.' });
+    }
+    if (String(newPassword).length < 8) {
+      return res.status(400).json({ message: 'New password must be at least 8 characters.' });
+    }
+    if (currentPassword === newPassword) {
+      return res.status(400).json({ message: 'New password must differ from the current one.' });
+    }
+
+    // req.user is sanitised (no hash), so re-read the record. '+password'
+    // explicitly includes the field, which the schema marks select:false.
+    const user = await db.findUser({ _id: req.user.id }, '+password');
+    if (!user?.password) {
+      return res
+        .status(400)
+        .json({ message: 'This account has no password set (it may use social login).' });
+    }
+
+    if (!bcrypt.compareSync(currentPassword, user.password)) {
+      logger.warn(`[changePassword] wrong current password for ${req.user.id}`);
+      return res.status(401).json({ message: 'Current password is incorrect.' });
+    }
+
+    const hash = bcrypt.hashSync(String(newPassword), 10);
+    await db.updateUser(req.user.id, { password: hash });
+
+    logger.info(`[changePassword] password changed for ${req.user.id}`);
+    return res.status(200).json({ message: 'Password updated.' });
+  } catch (error) {
+    logger.error('[changePassword]', error);
+    return res.status(500).json({ message: 'Could not update the password.' });
+  }
+};
+
 module.exports = {
   getUserController,
+  changePasswordController,
   getTermsStatusController,
   acceptTermsController,
   deleteUserController,

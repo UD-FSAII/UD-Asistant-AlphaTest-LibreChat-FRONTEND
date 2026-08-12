@@ -50,6 +50,9 @@ const SHIFT_TO_UNSHIFT: Record<string, string> = {
 };
 
 export function normalizeKey(key: string, shiftHeld?: boolean): string {
+  if (typeof key !== 'string') {
+    return '';
+  }
   if (SPECIAL_KEY_MAP[key]) {
     return SPECIAL_KEY_MAP[key];
   }
@@ -67,6 +70,16 @@ export function isModifierKey(key: string): boolean {
 }
 
 export function bindingFromEvent(e: KeyboardEvent): ShortcutBinding | null {
+  /**
+   * Chrome's password autofill dispatches a *trusted* `keydown` that is a plain
+   * `Event`, not a `KeyboardEvent` — so `e.key` is undefined despite the type
+   * signature. Without this guard `normalizeKey` throws on `.length`, killing
+   * the handler and any dialog it was inside. Upstream bug; affects every
+   * LibreChat dialog with an autofillable input.
+   */
+  if (typeof e.key !== 'string') {
+    return null;
+  }
   if (isModifierKey(e.key)) {
     return null;
   }

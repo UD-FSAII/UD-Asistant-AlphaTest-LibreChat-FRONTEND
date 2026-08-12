@@ -21,6 +21,7 @@ import EnableTwoFactorItem from '../SettingsTabs/Account/TwoFactorAuthentication
 import ImportConversations from '../SettingsTabs/Data/ImportConversations';
 import { toggleControl, ThemeSetting, LangSetting } from './controls';
 import BackupCodesItem from '../SettingsTabs/Account/BackupCodesItem';
+import ChangePassword from '../SettingsTabs/Account/ChangePassword';
 import { EngineSTTSetting, EngineTTSSetting } from './SpeechControls';
 import FontSizeSelector from '../SettingsTabs/Chat/FontSizeSelector';
 import AdvancedPrompts from '../SettingsTabs/Chat/AdvancedPrompts';
@@ -521,6 +522,16 @@ export const registry: SettingEntry[] = [
     Component: Avatar,
   },
   // Account · Security
+
+{
+    id: 'changePassword',
+    tab: ACCOUNT,
+    section: 'security',
+    labelKey: 'com_ui_settings_label_change_password',
+    keywords: ['password', 'change', 'security', 'credentials'],
+    show: (ctx) => ctx.isLocalProvider,
+    Component: ChangePassword,
+  },
   {
     id: 'twoFactor',
     tab: ACCOUNT,
