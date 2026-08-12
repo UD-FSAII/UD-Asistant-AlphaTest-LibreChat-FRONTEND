@@ -21,7 +21,17 @@ export default function Content({ activeTab, query, ctx }: ContentProps) {
   const tab = TABS.find((t) => t.id === activeTab)!;
 
   const results = useMemo(
-    () => (query.trim() ? filterSettings(registry, query, ctx, localize) : null),
+    () =>
+      query.trim()
+        ? filterSettings(
+            // This fork removes tabs from TABS; entries pointing at a removed tab
+            // would resolve tabMeta to undefined below and crash on `.sections`.
+            registry.filter((e) => TABS.some((t) => t.id === e.tab)),
+            query,
+            ctx,
+            localize,
+          )
+        : null,
     [query, ctx, localize],
   );
 
@@ -36,7 +46,13 @@ export default function Content({ activeTab, query, ctx }: ContentProps) {
           <div className="divide-y divide-border-light overflow-hidden rounded-xl border border-border-light text-sm text-text-primary">
             {results.map(({ entry, label }) => {
               const Cmp = entry.Component;
-              const tabMeta = TABS.find((t) => t.id === entry.tab)!;
+              // No `!` here: this fork removes tabs from TABS, so an orphaned
+              // registry entry resolves to undefined and search-only rendering
+              // crashes. Skip anything whose tab no longer exists.
+              const tabMeta = TABS.find((t) => t.id === entry.tab);
+              if (!tabMeta) {
+                return null;
+              }
               const sectionMeta = tabMeta.sections.find((s) => s.id === entry.section);
               return (
                 <div key={entry.id} className="px-4 py-3">
