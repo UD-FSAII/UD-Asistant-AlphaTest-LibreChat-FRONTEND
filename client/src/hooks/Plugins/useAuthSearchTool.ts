@@ -48,7 +48,10 @@ const useAuthSearchTool = (options?: { isEntityTool: boolean }) => {
   });
 
   const installTool = useCallback(
-    (data: SearchApiKeyFormData) => {
+    (
+      data: SearchApiKeyFormData,
+      callbacks?: { onSuccess?: () => void; onError?: (error: unknown) => void },
+    ) => {
       const auth = Object.entries({
         serperApiKey: data.serperApiKey,
         searxngInstanceUrl: data.searxngInstanceUrl,
@@ -68,16 +71,29 @@ const useAuthSearchTool = (options?: { isEntityTool: boolean }) => {
         },
         {} as Record<string, string>,
       );
-
-      updateUserPlugins.mutate({
-        pluginKey: Tools.web_search,
-        action: 'install',
-        auth,
-        isEntityTool,
-      });
+/**
+       * UD Assistant: forward per-call callbacks so the dialog can react to a
+       * rejected key. The server validates a user-supplied Brave key against
+       * Brave's API and returns 400 if it fails (see UserController
+       * `verifyBraveKey`) — without these the dialog closed regardless and the
+       * user believed a bad key had saved.
+       */
+      updateUserPlugins.mutate(
+        {
+          pluginKey: Tools.web_search,
+          action: 'install',
+          auth,
+          isEntityTool,
+        },
+        {
+          onSuccess: () => callbacks?.onSuccess?.(),
+          onError: (error) => callbacks?.onError?.(error),
+        },
+      );
     },
     [updateUserPlugins, isEntityTool],
   );
+
 
   const removeTool = useCallback(() => {
     updateUserPlugins.mutate({

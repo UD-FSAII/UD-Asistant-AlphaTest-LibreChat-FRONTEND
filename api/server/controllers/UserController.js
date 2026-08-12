@@ -195,6 +195,40 @@ const deleteUserMcpServers = async (userId) => {
   }
 };
 
+/**
+ * One cheap call to Brave to check a user-supplied key.
+ * Fails OPEN on network trouble — a transient outage shouldn't block onboarding.
+ */
+async function verifyBraveKey(key) {
+  const url = 'https://api.search.brave.com/res/v1/web/search?q=test&count=1';
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const r = await fetch(url, {
+      headers: { 'X-Subscription-Token': key, Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (r.ok) return { ok: true };
+    // 429 = valid key, quota/rate exhausted. Still a working key.
+    if (r.status === 429) return { ok: true };
+    if (r.status === 401 || r.status === 403 || r.status === 422) {
+      return {
+        ok: false,
+        message:
+          'That Brave Search API key was rejected. Copy it from ' +
+          'api-dashboard.search.brave.com → API keys and try again.',
+      };
+    }
+    logger.warn(`[verifyBraveKey] unexpected status ${r.status}; allowing save`);
+    return { ok: true };
+  } catch (err) {
+    logger.warn('[verifyBraveKey] could not reach Brave; allowing save:', err.message);
+    return { ok: true };
+  }
+}
+
 const updateUserPluginsController = async (req, res) => {
   const appConfig =
     req.config ??
@@ -249,6 +283,13 @@ const updateUserPluginsController = async (req, res) => {
     }
 
     if (action === 'install') {
+      const braveKey = req.body?.auth?.searxngApiKey;
+      if (braveKey) {
+        const verdict = await verifyBraveKey(braveKey);
+        if (!verdict.ok) {
+          return res.status(400).json({ message: verdict.message });
+        }
+      }
       for (let i = 0; i < keys.length; i++) {
         authService = await updateUserPluginAuth(user.id, keys[i], pluginKey, values[i]);
         if (authService instanceof Error) {

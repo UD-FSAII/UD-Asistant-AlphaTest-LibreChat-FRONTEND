@@ -23,7 +23,8 @@ function WebSearch() {
   const { badgeTriggerRef } = searchApiKeyForm;
 
   return (
-    (isPinned || (webSearch && authData?.authenticated)) && (
+    (authData?.authenticated ?? false) &&
+    (isPinned || webSearch) && (
       <CheckboxButton
         ref={badgeTriggerRef}
         className="max-w-fit"

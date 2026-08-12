@@ -163,6 +163,10 @@ modelSpecs:
           Queries must be plain phrases of 4-10 words. NEVER use quotes, site:, OR, or
           boolean syntax — they return almost nothing with this backend. If a search
           disappoints, rephrase plainly rather than adding operators.
+          
+          If a search returns no usable results, say so and stop. Do not answer from
+          memory. "My search returned nothing" is the correct answer; an answer
+          assembled without sources is a failure even if it sounds right.
 
           === SOURCES ===
           Institution-specific facts must come from that institution's own domain; never
