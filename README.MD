@@ -91,9 +91,11 @@ Let's Encrypt DNS-01 certs via Cloudflare. Files: `ud-assistant.conf`, `https-pr
 `HTTPS-SETUP.md`.
 
 - Proxies by container name over `librechat_default` (e.g. `proxy_pass http://api:3080`).
-- Serves multiple subdomains via separate `server` blocks: the chat
-  (`alphatest.udassistant.com`), per-user stats (`metrics.alphatest...`), and admin console
-  (`feedback.alphatest...`).
+- Serves multiple subdomains via separate `server` blocks: the chat (`${DOMAIN}`),
+  per-user stats (`metrics.${DOMAIN}`), and admin console (`feedback.${DOMAIN}`).
+  The hostname is not hard-coded anywhere: `ud-assistant.conf.template` is rendered at
+  container start from `DOMAIN`, whose single source of truth is `DOMAIN_CLIENT` in
+  `FRONTEND/LibreChat/.env` — change it with `make set-domain DOMAIN=...` in the parent repo.
 - **Certs** issued with the certbot Docker container + Cloudflare DNS plugin (no host certbot):
   ```bash
   docker run --rm -v /etc/letsencrypt:/etc/letsencrypt -v ~/.secrets/certbot:/secrets:ro \
