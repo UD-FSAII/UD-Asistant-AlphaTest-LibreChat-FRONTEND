@@ -23,7 +23,8 @@ User (on UD VPN) ──https://udassistant.duckdns.org──► https-proxy (ngi
 - **certbot runs separately from nginx.** Cert lives in `/etc/letsencrypt` on the
   host; nginx mounts it read-only. Renewal is decoupled from the proxy.
 
-Files: `ud-assistant.conf` (nginx), `https-proxy.compose.yml` (service), this doc.
+Files: `ud-assistant.conf.template` (nginx, rendered at container start),
+`https-proxy.compose.yml` (service), this doc.
 
 ---
 
@@ -41,14 +42,17 @@ Files: `ud-assistant.conf` (nginx), `https-proxy.compose.yml` (service), this do
 
 ---
 
-## STEP 2 — Put your hostname into the configs
-Replace the placeholder `udassistant.duckdns.org` everywhere:
+## STEP 2 — Set your hostname (one value, no config editing)
+`ud-assistant.conf.template` contains `${DOMAIN}` rather than a hostname; nginx renders
+it at container start. The single source of truth is `DOMAIN_CLIENT` in
+`FRONTEND/LibreChat/.env`, and the sub-domains are always `metrics.<DOMAIN>` and
+`feedback.<DOMAIN>`. From the repo root:
 ```bash
-cd ~/Projects/UD-Assistant/FRONTEND/LibreChat/https-proxy
-sed -i 's/udassistant\.duckdns\.org/YOURNAME.duckdns.org/g' ud-assistant.conf
-grep server_name ud-assistant.conf          # confirm
+make set-domain DOMAIN=chat.example.org   # rewrites .env (DRYRUN=1 to preview)
+make show-domain                          # confirm the three hostnames + cert status
 ```
-(If you keep the name `udassistant`, no edit needed.)
+`make start-proxy` exports `DOMAIN` for compose. Running compose by hand needs it too:
+`DOMAIN=chat.example.org docker compose -f https-proxy.compose.yml up -d`.
 
 ---
 
@@ -208,9 +212,12 @@ docker compose -f https-proxy.compose.yml down
 ---
 
 ## Gotchas
-- **Cert path mismatch = nginx won't start.** The `ssl_certificate` paths in
-  `ud-assistant.conf` must exactly match `/etc/letsencrypt/live/<yourname>/`.
-  If you renamed the domain, `sed` both the conf AND re-check the live dir name.
+- **Cert path mismatch = nginx won't start.** The `ssl_certificate` paths are
+  `/etc/letsencrypt/live/${DOMAIN}/` (and the `metrics.`/`feedback.` variants), so a
+  certificate must exist for all three names. `make certs DOMAIN=... EMAIL=...` issues
+  them; `make show-domain` reports whether the main one is present.
+- **`DOMAIN` unset = compose refuses to start.** That is deliberate — it beats
+  rendering an empty `server_name`. Use `make start-proxy` or export `DOMAIN`.
 - **DNS-01 needs the token, not port reachability.** If issuance fails with an
   NXDOMAIN/TXT error, the token is wrong or the domain name is mistyped — it is
   NOT a firewall problem (DNS-01 doesn't touch your host's inbound ports).

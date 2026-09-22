@@ -1,9 +1,17 @@
-# ud-assistant.conf — HTTPS reverse proxy for LibreChat
+# ud-assistant.conf.template — HTTPS reverse proxy for LibreChat
 # Terminates TLS and proxies to the LibreChat api container on :3080.
-# Mounted into the nginx container at /etc/nginx/conf.d/default.conf
 #
-# >>> EDIT the two server_name lines + the ssl_certificate paths to match
-#     your DuckDNS hostname. Placeholder: alphatest.udassistant.com <<<
+# This is a TEMPLATE, not a finished config. It is mounted at
+# /etc/nginx/templates/default.conf.template and the nginx image's entrypoint
+# (20-envsubst-on-templates.sh) renders it to /etc/nginx/conf.d/default.conf at
+# container start, substituting ${DOMAIN} — and ONLY ${DOMAIN}, because the
+# compose file sets NGINX_ENVSUBST_FILTER=^DOMAIN$, which is what keeps nginx's
+# own $host / $scheme / $request_uri / $connection_upgrade variables intact.
+#
+# There is nothing to edit here for a new deployment: DOMAIN comes from
+# DOMAIN_CLIENT in FRONTEND/LibreChat/.env via `make set-domain` / `make start-proxy`.
+# The two sub-domains are always metrics.${DOMAIN} and feedback.${DOMAIN}, and the
+# certificates are expected at /etc/letsencrypt/live/<each of the three names>/.
 
 # Maps the Upgrade header to the right Connection value for WebSockets.
 # Must be defined before the server blocks that use $connection_upgrade.
@@ -19,7 +27,7 @@ map $http_upgrade $connection_upgrade {
 # server {
 #     listen 80;
 #     listen [::]:80;
-#     server_name alphatest.udassistant.com;
+#     server_name ${DOMAIN};
 
 #     return 301 https://$host$request_uri;
 # }
@@ -29,13 +37,13 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
     http2 on;
-    server_name alphatest.udassistant.com;
+    server_name ${DOMAIN};
 
     # Let's Encrypt cert (issued via certbot DNS-01, section below).
     # These paths are inside the container; the compose file mounts the host's
     # /etc/letsencrypt read-only to the same path.
-    ssl_certificate     /etc/letsencrypt/live/alphatest.udassistant.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/alphatest.udassistant.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
 
     # Modern, safe TLS defaults.
     ssl_protocols       TLSv1.2 TLSv1.3;
@@ -79,10 +87,10 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
     http2 on;
-    server_name metrics.alphatest.udassistant.com;
+    server_name metrics.${DOMAIN};
 
-    ssl_certificate     /etc/letsencrypt/live/metrics.alphatest.udassistant.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/metrics.alphatest.udassistant.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/metrics.${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/metrics.${DOMAIN}/privkey.pem;
 
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
@@ -108,10 +116,10 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
     http2 on;
-    server_name feedback.alphatest.udassistant.com;
+    server_name feedback.${DOMAIN};
 
-    ssl_certificate     /etc/letsencrypt/live/feedback.alphatest.udassistant.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/feedback.alphatest.udassistant.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/feedback.${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/feedback.${DOMAIN}/privkey.pem;
 
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;

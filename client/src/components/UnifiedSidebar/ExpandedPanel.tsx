@@ -21,8 +21,13 @@ const FEEDBACK_FORM_URL = 'https://forms.gle/WbsXHRfb94QM136A7';
 /**
  * UD Assistant customization: per-user usage stats page.
  * Users log in with their LibreChat account and see only their own usage.
+ *
+ * Derived from the page's own host instead of hard-coded, so it stays correct on
+ * every deployment and a hostname change needs no rebuild. The stats app always
+ * lives at metrics.<chat host> — the https-proxy template enforces that convention.
+ * (In local dev on :3090 this points at metrics.localhost, which is expected.)
  */
-const STATS_APP_URL = 'https://metrics.alphatest.udassistant.com';
+const STATS_APP_URL = `https://metrics.${window.location.hostname}`;
 const AccountSettings = lazy(() => import('~/components/Nav/AccountSettings'));
 
 const NewChatButton = memo(function NewChatButton({
