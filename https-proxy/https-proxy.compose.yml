@@ -22,7 +22,9 @@ services:
     ports:
       # THIS is the one service that publishes host ports — it's the front door.
       # Bound to all interfaces so VPN users on the UD network can reach it.
-      # - "80:80"
+      # :80 only answers with a 301 to https:// (see the template) so a bare hostname
+      # typed into a browser works instead of being refused.
+      - "80:80"
       - "443:443"
     environment:
       # Fails loudly rather than rendering an empty server_name if DOMAIN is unset.

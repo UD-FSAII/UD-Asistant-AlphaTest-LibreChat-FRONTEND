@@ -21,16 +21,17 @@ map $http_upgrade $connection_upgrade {
 }
 
 # --- HTTP :80 -> redirect everything to HTTPS ---
-# (Kept even though the host is VPN-internal: browsers/users typing http:// get
-#  bounced to https:// instead of a dead connection. No ACME http-01 here — we
-#  validate via DNS-01, so port 80 carries only the redirect.)
-# server {
-#     listen 80;
-#     listen [::]:80;
-#     server_name ${DOMAIN};
+# Browsers try http:// first for a bare hostname. Without this block that attempt is
+# refused (ERR_CONNECTION_REFUSED) on any browser that has not yet cached this site's
+# HSTS header — i.e. every new user and device. No ACME http-01 here: certificates are
+# validated via DNS-01, so port 80 carries only the redirect.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN} metrics.${DOMAIN} feedback.${DOMAIN};
 
-#     return 301 https://$host$request_uri;
-# }
+    return 301 https://$host$request_uri;
+}
 
 # --- HTTPS :443 -> LibreChat ---
 server {
