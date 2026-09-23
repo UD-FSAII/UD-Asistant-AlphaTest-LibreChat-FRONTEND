@@ -28,6 +28,16 @@ fileConfig:
         - "application/vnd\\.openxmlformats-officedocument\\..*"
         - "application/vnd\\.ms-(word|powerpoint|excel)$"
         - "text/.*"
+    agents:
+      fileLimit: 5
+      fileSizeLimit: 35
+      totalSizeLimit: 50
+      supportedMimeTypes:
+        - "^image/(jpeg|png|gif|webp)$"
+        - "application/pdf"
+        - "application/vnd\\.openxmlformats-officedocument\\..*"
+        - "application/vnd\\.ms-(word|powerpoint|excel)$"
+        - "text/.*"
   ocr:
     supportedMimeTypes:
       - "^application/pdf$"
@@ -36,11 +46,11 @@ fileConfig:
       - "^application/vnd\\.ms-(word|powerpoint|excel)$"
   serverFileSizeLimit: 100
 interface:
-  agents: false        # removes the Agents endpoint/button
+  agents: true        # removes the Agents endpoint/button
   fileSearch: true       # enables the "Upload for File Search" chat-area option
   webSearch: true
-  modelSelect: false      # keep the model/endpoint selector visible
-  endpointsMenu: false 
+  modelSelect: true      # keep the model/endpoint selector visible
+  endpointsMenu: true 
   parameters: false       # ← brings back the parameters/settings panel
   presets: true          # ← lets users save/tweak presets
   multiConvo: false 
@@ -51,7 +61,7 @@ interface:
   customWelcome: "Welcome to UD Assistant. Ask a question, upload a document, or share an image to get started.."
 endpoints:
   agents:
-    disableBuilder: true          # keep the agent builder hidden (simplified UI)
+    disableBuilder: false          # keep the agent builder hidden (simplified UI)
     recursionLimit: 20
     maxRecursionLimit: 22
     capabilities:
@@ -63,7 +73,7 @@ endpoints:
   custom:
     - name: "vLLM"
       apiKey: "${VLLM_API_KEY}"
-      baseURL: "http://172.22.0.1:8000/v1" #"http://vllm-lb:8000/v1" for nginx 
+      baseURL: "http://host.docker.internal:8000/v1" #"http://vllm-lb:8000/v1" for nginx 
       models:
         default: ["Qwen/Qwen3.6-35B-A3B-FP8"]
         fetch: true
@@ -86,7 +96,7 @@ endpoints:
 
     - name: "vLLM-Thinking"
       apiKey: "${VLLM_API_KEY}"
-      baseURL: "http://172.22.0.1:8000/v1" #"http://vllm-lb:8000/v1" for nginx 
+      baseURL: "http://host.docker.internal:8000/v1" #"http://vllm-lb:8000/v1" for nginx 
       customParams:
         reasoningKey: "reasoning"
       models:
@@ -112,7 +122,7 @@ endpoints:
           enable_thinking: true 
 
 modelSpecs:
-  enforce: true        # false = your prompt is the DEFAULT, users can still tweak params
+  enforce: false        # false = your prompt is the DEFAULT, users can still tweak params
   prioritize: true      # this spec is the default selection on new chats
   list:
     - name: "ud-assistant"
@@ -288,6 +298,14 @@ modelSpecs:
 
           Once you decline a request, do not re-plan it or search for alternatives.
           Respond briefly, offer one legitimate alternative if obvious, and move on.
+    - name: "ud-assistant-kb"
+      label: "UD Assistant (UD documents)"
+      default: false
+      description: "Answers from University of Delaware reference documents. No web search."
+      preset:
+        endpoint: "agents"
+        agent_id: "agent_8OEpHvM3v6dVpx2CGZDZl"
+        maxContextTokens: 180000
 webSearch:
   searchProvider: "searxng"
   searxngInstanceUrl: "${SEARXNG_INSTANCE_URL}"
