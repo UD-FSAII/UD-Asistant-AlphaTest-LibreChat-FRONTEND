@@ -1,4 +1,5 @@
 import React, { useMemo } from 'react';
+import { ChevronDown } from 'lucide-react';
 import { TooltipAnchor } from '@librechat/client';
 import { getConfigDefaults } from 'librechat-data-provider';
 import type { ModelSelectorProps } from '~/common';
@@ -81,6 +82,12 @@ function ModelSelectorContent() {
             </div>
           )}
           <span className="flex-grow truncate text-left">{selectedDisplayValue}</span>
+          {/* UD Assistant customization: say that this opens a menu. Words hide on
+              narrow screens so the model name keeps its space; the arrow always shows. */}
+          <span className="flex flex-shrink-0 items-center gap-1 text-xs text-text-secondary">
+            <span className="hidden sm:inline">{localize('com_ui_change_model')}</span>
+            <ChevronDown className="size-4" aria-hidden="true" />
+          </span>
         </button>
       }
     />
