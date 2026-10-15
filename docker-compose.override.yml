@@ -24,6 +24,10 @@ services:
       - ./patches/completions.js:/app/node_modules/@langchain/openai/dist/converters/completions.js:ro
       - ./patches/completions.cjs:/app/node_modules/@langchain/openai/dist/converters/completions.cjs:ro
       - ./patches/ToolNode.cjs:/app/node_modules/@librechat/agents/dist/cjs/tools/ToolNode.cjs:ro
+      # file_search reranking, only for the agents in FILE_SEARCH_RERANK_AGENTS (.env); empty = stock search.
+      # Rollback: empty that setting, or remove these two lines; then docker compose up -d api.
+      - ./patches/fileSearch.js:/app/api/app/clients/tools/util/fileSearch.js:ro
+      - ./patches/fileSearchRerank.js:/app/api/app/clients/tools/util/fileSearchRerank.js:ro
       # - ./index.html:/app/client/dist/index.html
     extra_hosts:
       - "host.docker.internal:host-gateway"
